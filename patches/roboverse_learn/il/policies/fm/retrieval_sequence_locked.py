@@ -12,8 +12,10 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,10 @@ from roboverse_learn.il.runners.default_runner import DefaultRunner
 
 WRONG_PHASE = {0: 3, 1: 0, 2: 3, 3: 2}
 RUNNER_CONFIG: dict[str, Any] | None = None
+# Optional, process-local capture used only by the success-memory insertion
+# diagnostic.  It is deliberately populated by the retrieval runner rather
+# than DefaultEvalRunner, so the evaluation protocol stays untouched.
+EPISODIC_SOURCE_CAPTURE: list[dict[str, Any]] | None = None
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1204,22 +1210,356 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
         config = RUNNER_CONFIG
         if config is None:
             raise RuntimeError("RUNNER_CONFIG is not initialized")
-        if abs(float(self.bank_depth) - 0.8) > 1e-6:
-            raise ValueError("Flow-condition QKV requires an x0.8 source bank")
+        if not 0.0 <= float(self.bank_depth) <= 1.0:
+            raise ValueError(f"Flow-condition QKV source depth must be in [0, 1], got {self.bank_depth}")
         self.flow_qkv_top_m = max(1, int(config.get("qkv_top_m", 32)))
         self.flow_qkv_temperature = float(config.get("qkv_temperature", 0.07))
+        self.flow_qkv_value_mode = str(config.get("qkv_value_mode", "weighted"))
+        if self.flow_qkv_value_mode not in {
+            "weighted", "top1", "compatibility", "compatibility_prefix",
+            "compatibility_release", "transition_verified",
+            "temporal_compatibility", "geometric_temporal_compatibility",
+        }:
+            raise ValueError(f"Unknown qkv_value_mode={self.flow_qkv_value_mode!r}")
+        self.flow_qkv_sequence_lock = bool(config.get("qkv_sequence_lock", False))
+        # In validated-escape mode a previous expert path contributes a
+        # checked continuation candidate, but never blocks global retrieval.
+        self.flow_qkv_validated_escape_lock = bool(
+            config.get("qkv_validated_escape_lock", False)
+        )
+        # Keep Flow generation unchanged, but rank real source candidates by
+        # the action slice that DefaultEvalRunner actually executes.
+        self.flow_qkv_executed_window_compatibility = bool(
+            config.get("qkv_executed_window_compatibility", False)
+        )
+        # A validated successor is prepended at candidate rank 0.  When this
+        # switch is enabled, validation is a real continuation decision rather
+        # than merely an invitation for the local compatibility score to
+        # reconsider the successor alongside unrelated trajectories.
+        self.flow_qkv_force_validated_successor = bool(
+            config.get("qkv_force_validated_successor", False)
+        )
+        if self.flow_qkv_force_validated_successor and not self.flow_qkv_validated_escape_lock:
+            raise ValueError(
+                "qkv_force_validated_successor requires qkv_validated_escape_lock"
+            )
+        self.flow_qkv_escape_semantic_tolerance = max(
+            0.0, float(config.get("qkv_escape_semantic_tolerance", 0.01))
+        )
+        self.flow_qkv_lock_window = max(1, int(config.get("qkv_lock_window", 4)))
+        configured_gate = config.get("qkv_min_similarity")
+        self.flow_qkv_min_similarity = (
+            None if configured_gate is None else float(configured_gate)
+        )
         self.flow_qkv_attention = FlowConditionActionQKV(
             temperature=self.flow_qkv_temperature,
             top_m=self.flow_qkv_top_m,
         )
         self.flow_qkv_adaptive_depth = self.method == "flow_condition_qkv_adaptive_depth_inverse"
+        self.flow_qkv_transition_verified = (
+            self.flow_qkv_value_mode == "transition_verified"
+            or self.flow_qkv_validated_escape_lock
+        )
+        # A source memory should describe a *trajectory segment*, not a bag
+        # of independently retrievable actions.  In this mode the recent
+        # rollout conditions/proprioceptions are matched against consecutive
+        # nodes from one stored trajectory before action compatibility chooses
+        # between the resulting real (never averaged) inverse states.
+        self.flow_qkv_temporal = (
+            self.flow_qkv_value_mode in {
+                "temporal_compatibility", "geometric_temporal_compatibility",
+            }
+        )
+        self.flow_qkv_geometric_temporal = (
+            self.flow_qkv_value_mode == "geometric_temporal_compatibility"
+        )
+        self.flow_qkv_temporal_history = max(
+            2, int(config.get("qkv_temporal_history", 3))
+        )
+        self.flow_qkv_spatial_pool = max(
+            4, int(config.get("qkv_spatial_pool", 128))
+        )
+        self._recent_condition: list[deque[torch.Tensor]] = [
+            deque(maxlen=self.flow_qkv_temporal_history) for _ in range(self.num_envs)
+        ]
+        self._recent_proprio: list[deque[torch.Tensor]] = [
+            deque(maxlen=self.flow_qkv_temporal_history) for _ in range(self.num_envs)
+        ]
+        self._temporal_predecessor_by_index: dict[int, int] = {}
+        if self.flow_qkv_temporal:
+            for values in self.memory.values():
+                required_spatial_key = (
+                    "proprio_state" if self.flow_qkv_geometric_temporal
+                    else "proprio_feature"
+                )
+                if required_spatial_key not in values:
+                    raise RuntimeError(
+                        f"{self.flow_qkv_value_mode} requires a memory with actual "
+                        f"{required_spatial_key} values"
+                    )
+                if "proprio_feature" in values:
+                    values["proprio_feature"] = F.normalize(
+                        values["proprio_feature"].to(self._torch_device), dim=-1
+                    )
+                if "proprio_state" in values:
+                    values["proprio_state"] = values["proprio_state"].to(self._torch_device)
+            self._build_temporal_graph()
+        # ``DefaultEvalRunner`` numbers episodes locally from zero.  A
+        # continual-memory driver may evaluate one task instance per process,
+        # so retain its real stream index for leave-one-demo-out exclusion and
+        # for unambiguous captured-record provenance.
+        self.episode_id_offset = int(config.get("episode_id_offset", 0))
+        # A support rollout can optionally expose the *actual discrete x0*
+        # selected under each observed condition.  The driver retains records
+        # only for whole-episode successes after evaluation completes.  This
+        # captures a condition--source association, never a gradient/update
+        # to the frozen Flow model.
+        self.capture_source_records = bool(config.get("capture_source_records", False))
+        capture_dir = config.get("capture_source_dir")
+        self.capture_source_dir = (
+            Path(capture_dir).expanduser().resolve()
+            if self.capture_source_records and capture_dir else None
+        )
+        if self.capture_source_dir is not None:
+            self.capture_source_dir.mkdir(parents=True, exist_ok=True)
+        if self.capture_source_records:
+            global EPISODIC_SOURCE_CAPTURE
+            EPISODIC_SOURCE_CAPTURE = []
+        self._transition_successor_index = [None] * self.num_envs
+        self._transition_successor_by_index: dict[int, int] = {}
+        self._transition_validation_threshold = None
+        if self.flow_qkv_transition_verified:
+            self._build_transition_graph()
+
+    def _runtime_episode_id(self, env_id: int) -> int:
+        return self.episode_id_offset + self._episode_counter * self.num_envs + env_id
+
+    def reset(self):
+        super().reset()
+        # Never carry a trajectory pointer across episodes.  A pointer is
+        # merely a hypothesis until the next real observation validates it.
+        self._transition_successor_index = [None] * self.num_envs
+        self._recent_condition = [
+            deque(maxlen=self.flow_qkv_temporal_history) for _ in range(self.num_envs)
+        ]
+        self._recent_proprio = [
+            deque(maxlen=self.flow_qkv_temporal_history) for _ in range(self.num_envs)
+        ]
 
     @torch.no_grad()
-    def _retrieve_flow_qkv(self, condition: torch.Tensor):
+    def _current_proprio_state(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return policy-normalized (but not L2-normalized) joint history.
+
+        The per-joint limits normalizer equalizes coordinate scale.  Keeping
+        its magnitude is essential: L2 cosine of a high-dimensional joint
+        history is nearly saturated even for geometrically different arms.
+        """
+        normalized = self.policy.normalizer.normalize(obs)["agent_pos"]
+        history = normalized[:, : self.policy.n_obs_steps].reshape(normalized.shape[0], -1)
+        return history.to(self._torch_device).float()
+
+    @torch.no_grad()
+    def _current_proprio_feature(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Legacy cosine key retained for the original temporal control."""
+        return F.normalize(self._current_proprio_state(obs), dim=-1)
+
+    @torch.no_grad()
+    def _build_temporal_graph(self) -> None:
+        """Index real predecessor nodes separated by one executed chunk."""
+        values = self.memory["__global__"]
+        stride = max(1, int(self.policy.n_action_steps))
+        episodes = [int(value) for value in values["episode_index"].tolist()]
+        starts = [int(value) for value in values["global_start"].tolist()]
+        by_episode_start = {
+            (episode, start): index
+            for index, (episode, start) in enumerate(zip(episodes, starts))
+        }
+        self._temporal_predecessor_by_index = {
+            index: predecessor
+            for index, (episode, start) in enumerate(zip(episodes, starts))
+            if (predecessor := by_episode_start.get((episode, start - stride))) is not None
+        }
+        if not self._temporal_predecessor_by_index:
+            raise RuntimeError(
+                "temporal_compatibility found no contiguous +n_action_steps memory paths"
+            )
+
+    @torch.no_grad()
+    def _temporal_candidate_indices(
+        self,
+        condition: torch.Tensor,
+        proprio: torch.Tensor,
+        env_id: int,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Rank current nodes by a contiguous recent rollout-to-memory match.
+
+        At the first query no temporal context exists, so the usual frozen
+        Flow-condition retrieval is retained.  From the second query onward,
+        a candidate is admissible only when it has enough *real predecessor*
+        nodes from the same stored trajectory.  Spatial (proprio) and Flow
+        condition cosines are averaged at every aligned time point; neither
+        source state nor feature is blended.
+        """
+        values = self.memory["__global__"]
+        current_condition = F.normalize(condition[env_id].flatten(), dim=0)
+        current_proprio = proprio[env_id]
+        self._recent_condition[env_id].append(current_condition.detach())
+        self._recent_proprio[env_id].append(current_proprio.detach())
+        history_condition = list(self._recent_condition[env_id])
+        history_proprio = list(self._recent_proprio[env_id])
+        history_length = len(history_condition)
+
+        condition_keys = F.normalize(values["condition"].flatten(1), dim=-1)
+        if self.flow_qkv_geometric_temporal:
+            spatial_keys = values["proprio_state"]
+        else:
+            spatial_keys = values["proprio_feature"]
+        valid_indices = torch.where(valid)[0]
+        if len(valid_indices) == 0:
+            valid_indices = torch.arange(len(values["source"]), device=self._torch_device)
+
+        # Candidate nodes must have a complete contiguous predecessor path.
+        if history_length >= 2:
+            contiguous = []
+            for index in valid_indices.detach().cpu().tolist():
+                cursor = int(index)
+                for _ in range(history_length - 1):
+                    cursor = self._temporal_predecessor_by_index.get(cursor, -1)
+                    if cursor < 0:
+                        break
+                else:
+                    contiguous.append(int(index))
+            if contiguous:
+                candidate_indices = torch.tensor(
+                    contiguous, device=self._torch_device, dtype=torch.long
+                )
+            else:
+                # A missing path is an unsupported temporal query, not an
+                # excuse to fabricate continuity.  Use the static retrieval
+                # as an explicit cold-start fallback.
+                candidate_indices = valid_indices
+                history_condition = history_condition[-1:]
+                history_proprio = history_proprio[-1:]
+        else:
+            candidate_indices = valid_indices
+
+        node_indices = candidate_indices.clone()
+        condition_scores = torch.zeros(len(candidate_indices), device=self._torch_device)
+        spatial_values = torch.zeros(len(candidate_indices), device=self._torch_device)
+        reversed_history = list(zip(
+            reversed(history_condition), reversed(history_proprio)
+        ))
+        for history_index, (condition_query, proprio_query) in enumerate(reversed_history):
+            condition_scores += condition_keys[node_indices] @ condition_query
+            if self.flow_qkv_geometric_temporal:
+                # RMS in policy-normalized joint coordinates is an actual
+                # spatial discrepancy.  It retains both joint magnitude and
+                # direction, unlike the saturated cosine control above.
+                spatial_values += (
+                    (spatial_keys[node_indices] - proprio_query)
+                    .pow(2).mean(dim=-1).sqrt()
+                )
+            else:
+                spatial_values += spatial_keys[node_indices] @ proprio_query
+            # No predecessor is needed after scoring the oldest aligned
+            # query.  Advancing once more would incorrectly demand a fourth
+            # node for a three-node temporal match.
+            if history_index + 1 < len(reversed_history):
+                node_indices = torch.tensor(
+                    [self._temporal_predecessor_by_index[int(index)] for index in node_indices.tolist()],
+                    device=self._torch_device,
+                    dtype=torch.long,
+                )
+        condition_scores /= float(len(history_condition))
+        spatial_values /= float(len(history_condition))
+        top_count = min(self.flow_qkv_top_m, len(candidate_indices))
+        if self.flow_qkv_geometric_temporal:
+            # Two-stage retrieval avoids an arbitrary feature-weight: the
+            # frozen Flow condition first enforces semantic/visual support;
+            # within that support raw joint RMS determines spatial-temporal
+            # continuity.  Sources remain separate Flow candidates.
+            pool_count = min(self.flow_qkv_spatial_pool, len(candidate_indices))
+            _, semantic_order = torch.topk(condition_scores, k=pool_count)
+            semantic_indices = candidate_indices[semantic_order]
+            semantic_spatial = spatial_values[semantic_order]
+            negative_distance, spatial_order = torch.topk(-semantic_spatial, k=top_count)
+            top_indices = semantic_indices[spatial_order]
+            top_scores = negative_distance
+            current_spatial = -semantic_spatial[spatial_order]
+        else:
+            scores = 0.5 * (condition_scores + spatial_values)
+            top_scores, order = torch.topk(scores, k=top_count)
+            top_indices = candidate_indices[order]
+            current_spatial = spatial_keys[top_indices] @ current_proprio
+        current_condition_scores = condition_keys[top_indices] @ current_condition
+        return top_indices, top_scores, {
+            "temporal_history_length": int(history_length),
+            "temporal_path_matched": bool(len(history_condition) == history_length),
+            "temporal_current_condition_scores": current_condition_scores.detach().cpu().tolist(),
+            "temporal_current_spatial_scores": current_spatial.detach().cpu().tolist(),
+            "temporal_spatial_metric": (
+                "negative_normalized_joint_history_rms"
+                if self.flow_qkv_geometric_temporal else "proprio_cosine"
+            ),
+            "temporal_semantic_pool": (
+                int(min(self.flow_qkv_spatial_pool, len(candidate_indices)))
+                if self.flow_qkv_geometric_temporal else None
+            ),
+        }
+
+    @torch.no_grad()
+    def _build_transition_graph(self) -> None:
+        """Build a one-executed-chunk successor graph over real memory items.
+
+        A node is an expert action window.  Its successor is the window from
+        the same demonstration whose start advances by exactly
+        ``n_action_steps``.  The acceptance threshold is calibrated only from
+        expert consecutive-condition similarities; no rollout success or task
+        labels are used.
+        """
+        values = self.memory["__global__"]
+        stride = max(1, int(self.policy.n_action_steps))
+        episodes = [int(value) for value in values["episode_index"].tolist()]
+        starts = [int(value) for value in values["global_start"].tolist()]
+        by_episode_start = {
+            (episode, start): index
+            for index, (episode, start) in enumerate(zip(episodes, starts))
+        }
+        self._transition_successor_by_index = {
+            index: successor
+            for index, (episode, start) in enumerate(zip(episodes, starts))
+            if (successor := by_episode_start.get((episode, start + stride))) is not None
+        }
+        if not self._transition_successor_by_index:
+            raise RuntimeError("Transition-verified retrieval found no +n_action_steps successors")
+        predecessor = torch.tensor(
+            list(self._transition_successor_by_index), dtype=torch.long, device=self._torch_device
+        )
+        successor = torch.tensor(
+            [self._transition_successor_by_index[int(index)] for index in predecessor.tolist()],
+            dtype=torch.long,
+            device=self._torch_device,
+        )
+        condition = F.normalize(values["condition"].flatten(1), dim=-1)
+        transition_similarity = (condition[predecessor] * condition[successor]).sum(dim=-1)
+        # A 5th percentile support boundary is deliberately conservative: it
+        # answers only whether the observed successor could plausibly be the
+        # next local state of this expert memory path.
+        self._transition_validation_threshold = float(
+            torch.quantile(transition_similarity, 0.05).item()
+        )
+
+    @torch.no_grad()
+    def _retrieve_flow_qkv(
+        self,
+        condition: torch.Tensor,
+        proprio: torch.Tensor | None = None,
+    ):
         values = self.memory["__global__"]
         keys = values["condition"].flatten(1)
         sources, expert_conditions, metadata = [], [], []
-        query_episodes = self._episode_counter * self.num_envs + np.arange(condition.shape[0])
+        query_episodes = self.episode_id_offset + self._episode_counter * self.num_envs + np.arange(condition.shape[0])
         bank_episode_ids = values["episode_index"].to(self._torch_device)
         for env_id in range(condition.shape[0]):
             valid = torch.ones(
@@ -1227,31 +1567,483 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
             )
             if self.exclude_same_episode:
                 valid &= bank_episode_ids != int(query_episodes[env_id])
-            result = self.flow_qkv_attention(
-                query=condition[env_id].flatten(),
-                keys=keys,
-                value_source=values["source"],
-                valid_mask=valid,
-            )
-            sources.append(result.source)
-            expert_conditions.append(values["condition"][result.top_index : result.top_index + 1])
-            top_indices = result.top_indices.detach().cpu().tolist()
+            if self.flow_qkv_sequence_lock and not self.flow_qkv_validated_escape_lock:
+                locked_episode = self._locked_episode[env_id]
+                locked_start = self._locked_start[env_id]
+                if locked_episode is not None and locked_start is not None:
+                    same_locked_episode = valid & (bank_episode_ids == locked_episode)
+                    # One rollout update executes n_action_steps actions.  A
+                    # locked memory trajectory must therefore advance by at
+                    # least one complete action window; using only
+                    # global_start > locked_start repeatedly selected starts
+                    # one frame apart and replayed almost identical chunks.
+                    stride = max(1, int(self.policy.n_action_steps))
+                    next_start = locked_start + stride
+                    forward_only = same_locked_episode & (
+                        values["global_start"].to(self._torch_device) >= next_start
+                    )
+                    if bool(forward_only.any()):
+                        local_forward = forward_only & (
+                            values["global_start"].to(self._torch_device)
+                            <= locked_start + self.flow_qkv_lock_window * stride
+                        )
+                        valid = local_forward if bool(local_forward.any()) else forward_only
+            temporal_fields: dict[str, Any] = {}
+            if self.flow_qkv_temporal:
+                if proprio is None:
+                    raise RuntimeError("temporal_compatibility requires a proprio query")
+                top_indices_tensor, top_scores_tensor, temporal_fields = self._temporal_candidate_indices(
+                    condition, proprio, env_id, valid
+                )
+                top_index = int(top_indices_tensor[0].item())
+                # All candidates remain individual, on-trajectory source
+                # states.  The subsequent compatibility stage is the same
+                # action-space feasibility check used by the best existing
+                # discrete retrieval baseline.
+                sources.append(values["source"][top_indices_tensor])
+                attention_entropy = float("nan")
+                effective_k = float(len(top_indices_tensor))
+                weights = [1.0 / float(len(top_indices_tensor))] * len(top_indices_tensor)
+            else:
+                result = self.flow_qkv_attention(
+                    query=condition[env_id].flatten(),
+                    keys=keys,
+                    value_source=values["source"],
+                    valid_mask=valid,
+                )
+                top_indices_tensor = result.top_indices
+                top_scores_tensor = result.top_scores
+                top_index = int(result.top_index)
+                if self.flow_qkv_value_mode == "top1":
+                    sources.append(values["source"][top_index])
+                elif self.flow_qkv_value_mode in {
+                    "compatibility", "compatibility_prefix", "compatibility_release",
+                    "transition_verified",
+                }:
+                    # Preserve each real inverse state as an independent action
+                    # proposal.  In particular, never average sources before the
+                    # Flow forward pass: latent averaging was empirically brittle.
+                    sources.append(values["source"][top_indices_tensor])
+                else:
+                    sources.append(result.source)
+                attention_entropy = result.entropy
+                effective_k = result.effective_k
+                weights = [float(weight) for weight in result.weights.detach().cpu().tolist()]
+            expert_conditions.append(values["condition"][top_index : top_index + 1])
+            # Do not advance the lock here.  In compatibility mode, the
+            # QKV-top-1 proposal is not necessarily the real inverse state
+            # that is propagated and executed below.  The lock is updated
+            # only after action-space selection has identified that executed
+            # discrete source.
+            top_indices = top_indices_tensor.detach().cpu().tolist()
             metadata.append({
-                "top_index": result.top_index,
-                "episode": int(values["episode_index"][result.top_index].item()),
-                "start": int(values["global_start"][result.top_index].item()),
+                "top_index": top_index,
+                "top_indices": [int(index) for index in top_indices],
+                "episode": int(values["episode_index"][top_index].item()),
+                "start": int(values["global_start"][top_index].item()),
                 "top_episode_indices": [
                     int(values["episode_index"][index].item()) for index in top_indices
                 ],
                 "top_global_starts": [
                     int(values["global_start"][index].item()) for index in top_indices
                 ],
-                "weights": [float(weight) for weight in result.weights.detach().cpu().tolist()],
-                "top1_similarity": float(result.top_scores[0].item()),
-                "attention_entropy": result.entropy,
-                "effective_k": result.effective_k,
+                "top_scores": [float(score) for score in top_scores_tensor.detach().cpu().tolist()],
+                "weights": weights,
+                "top1_similarity": float(top_scores_tensor[0].item()),
+                "attention_entropy": attention_entropy,
+                "effective_k": effective_k,
+                "value_mode": self.flow_qkv_value_mode,
+                "sequence_lock": self.flow_qkv_sequence_lock,
+                "validated_escape_lock": self.flow_qkv_validated_escape_lock,
+                **temporal_fields,
             })
         return torch.stack(sources).to(self._torch_device), torch.cat(expert_conditions, dim=0), metadata
+
+    @torch.no_grad()
+    def _transition_validate_and_augment(
+        self,
+        condition: torch.Tensor,
+        sources: torch.Tensor,
+        metadata: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+        """Offer a validated local successor alongside fresh global matches.
+
+        This is explicitly not the earlier blind sequence lock.  The previous
+        selected memory node first proposes its known successor.  In
+        validated-escape mode that successor is retained when its *current*
+        semantic match is within a small cosine tolerance of the best fresh
+        global candidate; otherwise global retrieval is allowed to release
+        the stale trajectory.  Global retrieval remains available every chunk.
+        """
+        if not self.flow_qkv_transition_verified:
+            return sources, metadata
+        values = self.memory["__global__"]
+        keys = F.normalize(values["condition"].flatten(1), dim=-1)
+        query = F.normalize(condition.flatten(1), dim=-1)
+        adjusted = sources.clone()
+        for env_id, item in enumerate(metadata):
+            expected_index = self._transition_successor_index[env_id]
+            transition_similarity = None
+            transition_reference_similarity = None
+            transition_relative_gap = None
+            accepted = False
+            candidate_indices = list(item["top_indices"])
+            candidate_scores = list(item["top_scores"])
+            if expected_index is not None:
+                transition_similarity = float(
+                    (query[env_id] * keys[expected_index]).sum().item()
+                )
+                if self.flow_qkv_validated_escape_lock:
+                    # An absolute expert-to-expert threshold was too strict
+                    # under normal closed-loop state evolution.  The relevant
+                    # question is instead whether the old path remains as
+                    # semantically plausible as the freshly retrieved paths.
+                    transition_reference_similarity = max(
+                        item.get("temporal_current_condition_scores", [
+                            float("-inf")
+                        ])
+                    )
+                    transition_relative_gap = (
+                        transition_reference_similarity - transition_similarity
+                    )
+                    accepted = transition_relative_gap <= self.flow_qkv_escape_semantic_tolerance
+                else:
+                    accepted = transition_similarity >= float(self._transition_validation_threshold)
+                if accepted:
+                    # Keep real source states discrete.  The validated local
+                    # successor displaces only the weakest global proposal;
+                    # all other candidates are still re-retrieved globally.
+                    candidate_indices = [expected_index] + [
+                        index for index in candidate_indices if index != expected_index
+                    ]
+                    candidate_indices = candidate_indices[: self.flow_qkv_top_m]
+                    score_by_index = {
+                        index: score
+                        for index, score in zip(item["top_indices"], item["top_scores"])
+                    }
+                    score_by_index[expected_index] = transition_similarity
+                    candidate_scores = [score_by_index[index] for index in candidate_indices]
+                    adjusted[env_id] = values["source"][candidate_indices]
+            item["transition_expected_index"] = expected_index
+            item["transition_similarity"] = transition_similarity
+            item["transition_reference_similarity"] = transition_reference_similarity
+            item["transition_relative_gap"] = transition_relative_gap
+            item["transition_validation_threshold"] = self._transition_validation_threshold
+            item["transition_escape_semantic_tolerance"] = (
+                self.flow_qkv_escape_semantic_tolerance
+                if self.flow_qkv_validated_escape_lock else None
+            )
+            item["transition_accepted"] = accepted
+            item["top_indices"] = candidate_indices
+            item["top_scores"] = candidate_scores
+            item["top_episode_indices"] = [
+                int(values["episode_index"][index].item()) for index in candidate_indices
+            ]
+            item["top_global_starts"] = [
+                int(values["global_start"][index].item()) for index in candidate_indices
+            ]
+        return adjusted, metadata
+
+    @torch.no_grad()
+    def _predict_compatibility_action(
+        self,
+        obs: dict[str, torch.Tensor],
+        policy,
+        condition: torch.Tensor,
+        sources: torch.Tensor,
+        metadata: list[dict[str, Any]],
+        oracle_phase: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select a discrete inverse source after reconditioning in action space.
+
+        Observation cosine retrieval has many near ties.  For the top-M real
+        x0 states we therefore generate M actions under the *current*
+        condition and select the source that is both locally executable and
+        least rewritten relative to its expert action provenance.  This is a
+        parameter-free source-compatibility test, not a latent interpolation
+        or a learned critic.
+        """
+        if self.flow_qkv_adaptive_depth:
+            raise ValueError("compatibility selection is defined for a fixed source depth")
+        if self.flow_qkv_min_similarity is not None:
+            raise ValueError("Do not combine compatibility selection with a similarity gate")
+
+        batch_size, candidate_count = sources.shape[:2]
+        flat_sources = sources.reshape(batch_size * candidate_count, *sources.shape[2:])
+        flat_condition = condition.repeat_interleave(candidate_count, dim=0)
+        tic = time.perf_counter()
+        normalized_candidates = phase_bank.midpoint_integrate(
+            policy.model,
+            flat_sources,
+            flat_condition,
+            float(self.bank_depth),
+            1.0,
+            self.flow_steps,
+        ).reshape(batch_size, candidate_count, *sources.shape[2:])
+        phase_bank.sync(self._torch_device)
+        forward_ms = (time.perf_counter() - tic) * 1000.0
+        action_candidates = policy.normalizer["action"].unnormalize(normalized_candidates)
+
+        values = self.memory["__global__"]
+        candidate_indices = torch.tensor(
+            [item["top_indices"] for item in metadata],
+            dtype=torch.long,
+            device=self._torch_device,
+        )
+        expert_actions = values["raw_action"][candidate_indices]
+        future_start = policy.n_obs_steps - 1
+        future_end = future_start + policy.n_action_steps
+        captured_proprio_state = (
+            self._current_proprio_state(obs) if self.capture_source_records else None
+        )
+        captured_proprio = (
+            F.normalize(captured_proprio_state, dim=-1)
+            if captured_proprio_state is not None else None
+        )
+        current_joint = obs["agent_pos"][:, future_start].to(
+            device=self._torch_device, dtype=action_candidates.dtype
+        )
+
+        # The first executed position target must connect to the observed arm
+        # state.  The provenance term picks the source whose behavior remains
+        # most compatible after condition rewrite.  Both are RMS distances in
+        # action units, so their unweighted sum has no tuned coefficient.
+        boundary_error = (
+            (action_candidates[:, :, future_start] - current_joint[:, None])
+            .flatten(2)
+            .norm(dim=-1)
+            / math.sqrt(float(current_joint.shape[-1]))
+        )
+        # Default compatibility measures full-horizon transport.  The prefix
+        # variant uses exactly the [7:15] chunk the runner will execute.  It
+        # is not a coefficient sweep: it removes an otherwise irrelevant
+        # unexecuted tail from source selection.
+        rewrite_start, rewrite_end = (future_start, future_end) if (
+            self.flow_qkv_value_mode == "compatibility_prefix"
+            or self.flow_qkv_executed_window_compatibility
+        ) else (0, action_candidates.shape[2])
+        rewrite_error = (
+            (action_candidates[:, :, rewrite_start:rewrite_end]
+             - expert_actions[:, :, rewrite_start:rewrite_end])
+            .flatten(2)
+            .norm(dim=-1)
+            / math.sqrt(float(
+                action_candidates.shape[-1] * (rewrite_end - rewrite_start)
+            ))
+        )
+        compatibility_cost = boundary_error + rewrite_error
+        selected = torch.argmin(compatibility_cost, dim=1)
+        forced_successor = torch.zeros(
+            batch_size, dtype=torch.bool, device=self._torch_device
+        )
+        if self.flow_qkv_force_validated_successor:
+            for env_id, item in enumerate(metadata):
+                if not bool(item.get("transition_accepted", False)):
+                    continue
+                expected_index = item.get("transition_expected_index")
+                if expected_index is None or item["top_indices"][0] != expected_index:
+                    raise RuntimeError(
+                        "Validated successor must be candidate rank 0 before forced selection"
+                    )
+                selected[env_id] = 0
+                forced_successor[env_id] = True
+        batch_index = torch.arange(batch_size, device=self._torch_device)
+        normalized_trajectory = normalized_candidates[batch_index, selected]
+        action = action_candidates[batch_index, selected]
+
+        # A cosine threshold was not a reliable trust signal: successful and
+        # failed rollouts had nearly identical retrieval similarities.  In
+        # ``compatibility_release`` mode we instead compare the best discrete
+        # memory proposal against one native Gaussian source *after both have
+        # been propagated by the same frozen Flow solver*.  There is no latent
+        # blending and no learned gate.
+        release_mode = self.flow_qkv_value_mode == "compatibility_release"
+        gaussian_boundary_error = None
+        gaussian_smoothness_error = None
+        memory_feasibility_cost = None
+        gaussian_feasibility_cost = None
+        source_released = torch.zeros(batch_size, dtype=torch.bool, device=self._torch_device)
+        if release_mode:
+            memory_executed = action[:, future_start:future_end]
+            memory_smoothness_error = (
+                (memory_executed[:, 1:] - memory_executed[:, :-1])
+                .flatten(1)
+                .norm(dim=-1)
+                / math.sqrt(float(max(1, (future_end - future_start - 1) * current_joint.shape[-1])))
+            )
+            memory_feasibility_cost = boundary_error[batch_index, selected] + memory_smoothness_error
+
+            gaussian_source = torch.randn_like(sources[batch_index, selected])
+            tic = time.perf_counter()
+            gaussian_normalized = phase_bank.midpoint_integrate(
+                policy.model,
+                gaussian_source,
+                condition,
+                float(self.bank_depth),
+                1.0,
+                self.flow_steps,
+            )
+            phase_bank.sync(self._torch_device)
+            forward_ms += (time.perf_counter() - tic) * 1000.0
+            gaussian_action = policy.normalizer["action"].unnormalize(gaussian_normalized)
+            gaussian_boundary_error = (
+                (gaussian_action[:, future_start] - current_joint)
+                .flatten(1)
+                .norm(dim=-1)
+                / math.sqrt(float(current_joint.shape[-1]))
+            )
+            gaussian_executed = gaussian_action[:, future_start:future_end]
+            gaussian_smoothness_error = (
+                (gaussian_executed[:, 1:] - gaussian_executed[:, :-1])
+                .flatten(1)
+                .norm(dim=-1)
+                / math.sqrt(float(max(1, (future_end - future_start - 1) * current_joint.shape[-1])))
+            )
+            gaussian_feasibility_cost = gaussian_boundary_error + gaussian_smoothness_error
+            source_released = gaussian_feasibility_cost < memory_feasibility_cost
+            normalized_trajectory = torch.where(
+                source_released[:, None, None], gaussian_normalized, normalized_trajectory
+            )
+            action = torch.where(source_released[:, None, None], gaussian_action, action)
+
+        for env_id, item in enumerate(metadata):
+            choice = int(selected[env_id].item())
+            top_indices = item["top_indices"]
+            chosen_memory_index = top_indices[choice]
+            if self.flow_qkv_sequence_lock and not (
+                release_mode and bool(source_released[env_id].item())
+            ):
+                # Temporal continuity must follow the actual source that
+                # generated the executed chunk, not merely the QKV ranking.
+                self._locked_episode[env_id] = int(
+                    values["episode_index"][chosen_memory_index].item()
+                )
+                self._locked_start[env_id] = int(
+                    values["global_start"][chosen_memory_index].item()
+                )
+            if self.capture_source_records:
+                chosen_source = (
+                    gaussian_source[env_id]
+                    if release_mode and bool(source_released[env_id].item())
+                    else sources[env_id, choice]
+                )
+                # Keep all tensors in the exact normalized representation
+                # expected by the existing retrieval memory.  The episode
+                # outcome is intentionally unknown here; the driver filters
+                # records only after DefaultEvalRunner writes SuccessOnce.
+                assert EPISODIC_SOURCE_CAPTURE is not None
+                capture_record = {
+                    "episode_id": self._runtime_episode_id(env_id),
+                    "query_id": self._query_counter,
+                    "env_step": self.step,
+                    "condition": condition[env_id].detach().flatten().cpu().contiguous(),
+                    "source": chosen_source.detach().cpu().contiguous(),
+                    "raw_action": normalized_trajectory[env_id].detach().cpu().contiguous(),
+                    "proprio_feature": captured_proprio[env_id].detach().cpu().contiguous(),
+                    "proprio_state": captured_proprio_state[env_id].detach().cpu().contiguous(),
+                    "chunk_stride": int(policy.n_action_steps),
+                    "actual_source_used": (
+                        "gaussian" if release_mode and bool(source_released[env_id].item())
+                        else "memory"
+                    ),
+                }
+                EPISODIC_SOURCE_CAPTURE.append(capture_record)
+                # DefaultEvalRunner force-closes the Isaac Python process at
+                # the end of evaluation.  Persist each query now so an
+                # external continual controller can later filter by its
+                # official SuccessOnce file without modifying that runner.
+                if self.capture_source_dir is not None:
+                    torch.save(
+                        capture_record,
+                        self.capture_source_dir / (
+                            f"episode_{capture_record['episode_id']:06d}_"
+                            f"query_{capture_record['query_id']:06d}.pt"
+                        ),
+                    )
+            row = {
+                "episode_id": self._runtime_episode_id(env_id),
+                "query_id": self._query_counter,
+                "env_id": env_id,
+                "env_step": self.step,
+                "method": self.method,
+                "selected_phase": PHASES[int(oracle_phase[env_id].item())],
+                "selected_bank": "__global__",
+                "retrieval_top_m": candidate_count,
+                "retrieved_top_m_episode_indices": item["top_episode_indices"],
+                "retrieved_top_m_global_starts": item["top_global_starts"],
+                "retrieved_topk_weights": item["weights"],
+                "candidate_selected_rank": choice,
+                "candidate_forced_validated_successor": bool(
+                    forced_successor[env_id].item()
+                ),
+                "candidate_compatibility_costs": compatibility_cost[env_id].detach().cpu().tolist(),
+                "candidate_boundary_errors": boundary_error[env_id].detach().cpu().tolist(),
+                "candidate_rewrite_errors": rewrite_error[env_id].detach().cpu().tolist(),
+                "candidate_rewrite_scope": (
+                    "executed_slice" if rewrite_start == future_start
+                    else "full_horizon"
+                ),
+                "transition_expected_index": item.get("transition_expected_index"),
+                "transition_similarity": item.get("transition_similarity"),
+                "transition_validation_threshold": item.get("transition_validation_threshold"),
+                "transition_accepted": item.get("transition_accepted", False),
+                "temporal_history_length": item.get("temporal_history_length"),
+                "temporal_path_matched": item.get("temporal_path_matched"),
+                "temporal_current_condition_scores": item.get("temporal_current_condition_scores"),
+                "temporal_current_spatial_scores": item.get("temporal_current_spatial_scores"),
+                "temporal_spatial_metric": item.get("temporal_spatial_metric"),
+                "temporal_semantic_pool": item.get("temporal_semantic_pool"),
+                "memory_feasibility_cost": (
+                    None if memory_feasibility_cost is None
+                    else float(memory_feasibility_cost[env_id].item())
+                ),
+                "gaussian_feasibility_cost": (
+                    None if gaussian_feasibility_cost is None
+                    else float(gaussian_feasibility_cost[env_id].item())
+                ),
+                "gaussian_boundary_error": (
+                    None if gaussian_boundary_error is None
+                    else float(gaussian_boundary_error[env_id].item())
+                ),
+                "gaussian_smoothness_error": (
+                    None if gaussian_smoothness_error is None
+                    else float(gaussian_smoothness_error[env_id].item())
+                ),
+                "actual_source_used": (
+                    "gaussian" if bool(source_released[env_id].item()) else "memory"
+                ),
+                "retrieved_episode_index": int(values["episode_index"][chosen_memory_index].item()),
+                "retrieved_global_start": int(values["global_start"][chosen_memory_index].item()),
+                "retrieval_similarity": item["top_scores"][choice],
+                "retrieval_distance": 1.0 - item["top_scores"][choice],
+                "qkv_attention_entropy": item["attention_entropy"],
+                "qkv_effective_k": item["effective_k"],
+                "qkv_temperature": self.flow_qkv_temperature,
+                "qkv_value_mode": self.flow_qkv_value_mode,
+                "qkv_sequence_lock": self.flow_qkv_sequence_lock,
+                "qkv_temporal_history": (
+                    self.flow_qkv_temporal_history if self.flow_qkv_temporal else None
+                ),
+                "qkv_min_similarity": None,
+                "qkv_gate_accept": True,
+                "adaptive_t_star": float(self.bank_depth),
+                "adaptive_depth_bucket": f"fixed_t{self.bank_depth:.1f}",
+                "reverse_ms": 0.0,
+                "forward_ms": forward_ms,
+                "source_norm": float(
+                    (gaussian_source[env_id] if release_mode and bool(source_released[env_id].item())
+                     else sources[env_id, choice]).flatten().norm()
+                ),
+                "action_norm": float(normalized_trajectory[env_id].flatten().norm()),
+            }
+            self._append_trace(row)
+            self._append_retrieval_log(row)
+            if self.flow_qkv_transition_verified:
+                self._transition_successor_index[env_id] = self._transition_successor_by_index.get(
+                    chosen_memory_index
+                )
+        self._query_counter += 1
+        return action[:, future_start:future_end].transpose(0, 1).to(torch.float32)
 
     @torch.no_grad()
     def predict_action(self, observaton=None):
@@ -1261,7 +2053,47 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
         policy = self.policy
         condition, visual_phase = self._encode_condition_and_visual_phase(obs)
         oracle_phase = torch.full_like(visual_phase, self._oracle_time_phase())
-        sources, expert_conditions, metadata = self._retrieve_flow_qkv(condition)
+        proprio = (
+            self._current_proprio_state(obs) if self.flow_qkv_geometric_temporal
+            else self._current_proprio_feature(obs) if self.flow_qkv_temporal
+            else None
+        )
+        sources, expert_conditions, metadata = self._retrieve_flow_qkv(condition, proprio)
+
+        if self.flow_qkv_value_mode in {
+            "compatibility", "compatibility_prefix", "compatibility_release",
+            "transition_verified", "temporal_compatibility",
+            "geometric_temporal_compatibility",
+        }:
+            sources, metadata = self._transition_validate_and_augment(
+                condition, sources, metadata
+            )
+            return self._predict_compatibility_action(
+                obs, policy, condition, sources, metadata, oracle_phase
+            )
+
+        # Do not force a retrieved inverse state when the query is below an
+        # explicitly configured support threshold.  In that case preserve
+        # the native frozen-Flow Gaussian behavior for this query.
+        gate_mask = torch.zeros(
+            condition.shape[0], dtype=torch.bool, device=self._torch_device
+        )
+        native_normalized_full = None
+        if self.flow_qkv_min_similarity is not None:
+            gate_mask = torch.tensor(
+                [
+                    item["top1_similarity"] < self.flow_qkv_min_similarity
+                    for item in metadata
+                ],
+                dtype=torch.bool,
+                device=self._torch_device,
+            )
+            if bool(gate_mask.any()):
+                native_result = policy.predict_action(obs)
+                phase_bank.sync(self._torch_device)
+                native_normalized_full = policy.normalizer["action"].normalize(
+                    native_result["action_pred"]
+                ).to(torch.float32)
 
         low_sim, high_sim = self._adaptive_similarity_thresholds
         generated, depth_rows = [], []
@@ -1274,17 +2106,17 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
                 else:
                     target_depth, bucket = 0.4, "low_similarity_t0.4"
             else:
-                target_depth, bucket = 0.8, "fixed_t0.8"
+                target_depth, bucket = float(self.bank_depth), f"fixed_t{self.bank_depth:.1f}"
 
             source = sources[env_id : env_id + 1]
             reverse_ms = 0.0
-            if target_depth < 0.8:
+            if target_depth < float(self.bank_depth):
                 tic = time.perf_counter()
                 source = phase_bank.midpoint_integrate(
                     policy.model,
                     source,
                     expert_conditions[env_id : env_id + 1],
-                    0.8,
+                    float(self.bank_depth),
                     target_depth,
                     self.flow_steps,
                 )
@@ -1306,12 +2138,14 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
             depth_rows.append((target_depth, bucket, reverse_ms, forward_ms))
 
         normalized_trajectory = torch.cat(generated, dim=0)
+        if native_normalized_full is not None:
+            normalized_trajectory[gate_mask] = native_normalized_full[gate_mask]
         action = policy.normalizer["action"].unnormalize(normalized_trajectory)
         normalized_for_log = policy.normalizer["action"].normalize(action)
         for env_id, item in enumerate(metadata):
             target_depth, bucket, reverse_ms, forward_ms = depth_rows[env_id]
             row = {
-                "episode_id": self._episode_counter * self.num_envs + env_id,
+                "episode_id": self._runtime_episode_id(env_id),
                 "query_id": self._query_counter,
                 "env_id": env_id,
                 "env_step": self.step,
@@ -1329,6 +2163,10 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
                 "qkv_attention_entropy": item["attention_entropy"],
                 "qkv_effective_k": item["effective_k"],
                 "qkv_temperature": self.flow_qkv_temperature,
+                "qkv_value_mode": item["value_mode"],
+                "qkv_sequence_lock": item["sequence_lock"],
+                "qkv_min_similarity": self.flow_qkv_min_similarity,
+                "qkv_gate_accept": not bool(gate_mask[env_id].item()),
                 "adaptive_t_star": target_depth,
                 "adaptive_depth_bucket": bucket,
                 "reverse_ms": reverse_ms,
@@ -1338,6 +2176,14 @@ class FlowConditionQKVRunner(PhaseFilteredLocalRetrievalRunner):
             }
             self._append_trace(row)
             self._append_retrieval_log(row)
+            if self.flow_qkv_sequence_lock and not bool(gate_mask[env_id].item()):
+                selected_memory_index = int(item["top_index"])
+                self._locked_episode[env_id] = int(
+                    self.memory["__global__"]["episode_index"][selected_memory_index].item()
+                )
+                self._locked_start[env_id] = int(
+                    self.memory["__global__"]["global_start"][selected_memory_index].item()
+                )
         self._query_counter += 1
         future_start = policy.n_obs_steps - 1
         future_end = future_start + policy.n_action_steps
@@ -1377,6 +2223,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-top-m", type=int, default=32)
     parser.add_argument("--qkv-top-m", type=int, default=32)
     parser.add_argument("--qkv-temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--qkv-value-mode",
+        choices=[
+            "weighted", "top1", "compatibility", "compatibility_prefix",
+            "compatibility_release", "transition_verified",
+            "temporal_compatibility", "geometric_temporal_compatibility",
+        ],
+        default="weighted",
+    )
+    parser.add_argument("--qkv-sequence-lock", action="store_true")
+    parser.add_argument(
+        "--qkv-executed-window-compatibility",
+        action="store_true",
+        help="Rank discrete inverse sources using only the action slice executed by the runner.",
+    )
+    parser.add_argument(
+        "--qkv-force-validated-successor",
+        action="store_true",
+        help=(
+            "Force candidate rank 0 when it is the accepted successor of the "
+            "previous expert-memory node; otherwise retain global Top-M selection."
+        ),
+    )
+    parser.add_argument(
+        "--qkv-validated-escape-lock",
+        action="store_true",
+        help=(
+            "Keep global geometric-temporal retrieval active; admit the previous "
+            "expert-path successor only after transition-support validation."
+        ),
+    )
+    parser.add_argument(
+        "--qkv-escape-semantic-tolerance",
+        type=float,
+        default=0.01,
+        help=(
+            "Validated-escape continuation is retained when its current cosine "
+            "match is no worse than this amount below the best global candidate."
+        ),
+    )
+    parser.add_argument("--qkv-lock-window", type=int, default=4)
+    parser.add_argument(
+        "--qkv-temporal-history",
+        type=int,
+        default=3,
+        help="Consecutive current/memory chunk states required by temporal_compatibility.",
+    )
+    parser.add_argument(
+        "--qkv-spatial-pool",
+        type=int,
+        default=128,
+        help="Flow-condition Top-M pool before raw-proprio temporal reranking.",
+    )
+    parser.add_argument("--qkv-min-similarity", type=float, default=None)
     parser.add_argument("--image-weight", type=float, default=0.8)
     parser.add_argument("--proprio-weight", type=float, default=0.2)
     parser.add_argument("--output-dir", default="/data/yiming/MomentVLA-main/il_outputs/phase_filtered_local_inverse_retrieval_pickcube/rollouts")
@@ -1384,6 +2284,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bank-episodes", type=int, default=50)
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--max-demos", type=int, default=50)
+    parser.add_argument(
+        "--task-id-start",
+        type=int,
+        default=0,
+        help="First task/demo index to evaluate (used by continual one-episode streams).",
+    )
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--task", default="pick_cube")
     parser.add_argument("--robot", default="franka")
@@ -1407,6 +2313,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-similarity", type=float, default=None)
     parser.add_argument("--max-candidate-dispersion", type=float, default=0.05)
     parser.add_argument("--phase-source", choices=["oracle", "visual"], default="oracle")
+    parser.add_argument(
+        "--capture-source-records",
+        action="store_true",
+        help="Capture selected x0/condition tuples for post-rollout success-only memory insertion.",
+    )
+    parser.add_argument(
+        "--capture-source-dir",
+        default=None,
+        help="Directory for per-query source records; required for cross-process continual insertion.",
+    )
     parser.add_argument("--use-ema", action="store_true", default=True)
     return parser.parse_args()
 
@@ -1434,11 +2350,28 @@ def run_one_rollout(args: argparse.Namespace, method: str, shift_cm: float, dept
         "retrieval_top_m": getattr(args, "retrieval_top_m", 32),
         "qkv_top_m": getattr(args, "qkv_top_m", 32),
         "qkv_temperature": getattr(args, "qkv_temperature", 0.07),
+        "qkv_value_mode": getattr(args, "qkv_value_mode", "weighted"),
+        "qkv_sequence_lock": getattr(args, "qkv_sequence_lock", False),
+        "qkv_executed_window_compatibility": getattr(
+            args, "qkv_executed_window_compatibility", False
+        ),
+        "qkv_force_validated_successor": getattr(
+            args, "qkv_force_validated_successor", False
+        ),
+        "qkv_validated_escape_lock": getattr(args, "qkv_validated_escape_lock", False),
+        "qkv_escape_semantic_tolerance": getattr(args, "qkv_escape_semantic_tolerance", 0.01),
+        "qkv_lock_window": getattr(args, "qkv_lock_window", 4),
+        "qkv_temporal_history": getattr(args, "qkv_temporal_history", 3),
+        "qkv_spatial_pool": getattr(args, "qkv_spatial_pool", 128),
+        "qkv_min_similarity": getattr(args, "qkv_min_similarity", None),
         "dinov3_model_path": getattr(args, "dinov3_model_path", ""),
         "image_weight": getattr(args, "image_weight", 0.8),
         "proprio_weight": getattr(args, "proprio_weight", 0.2),
         "min_similarity": args.min_similarity,
         "max_candidate_dispersion": args.max_candidate_dispersion,
+        "capture_source_records": bool(getattr(args, "capture_source_records", False)),
+        "capture_source_dir": getattr(args, "capture_source_dir", None),
+        "episode_id_offset": int(getattr(args, "task_id_start", 0)),
     }
     global RUNNER_CONFIG
     RUNNER_CONFIG = config
@@ -1454,8 +2387,8 @@ def run_one_rollout(args: argparse.Namespace, method: str, shift_cm: float, dept
     eval_args.sim = args.sim
     eval_args.num_envs = args.num_envs
     eval_args.max_demo = args.max_demos
-    eval_args.task_id_range_low = 0
-    eval_args.task_id_range_high = args.max_demos
+    eval_args.task_id_range_low = int(getattr(args, "task_id_start", 0))
+    eval_args.task_id_range_high = eval_args.task_id_range_low + args.max_demos
     eval_args.max_step = args.max_steps
     eval_args.headless = True
     eval_args.gpu_id = args.gpu_id
@@ -1469,8 +2402,57 @@ def run_one_rollout(args: argparse.Namespace, method: str, shift_cm: float, dept
     eval_args.save_video_freq = args.save_video_freq
     eval_args.subset = f"phase_filtered_local_{method}_{shift_cm:g}cm_d{depth:.1f}"
     started = time.perf_counter()
-    workspace.evaluate(ckpt_path=checkpoint_path)
+    # A continual-memory controller may supply a reproducible trajectory file
+    # with randomized initial joints.  The override is process-local and the
+    # original registered task path is restored immediately; DefaultEvalRunner
+    # itself is not modified.
+    # Generic child-process trajectory override used by the continual-memory
+    # controller.  Retain the old StackCube name only as a backward-compatible
+    # fallback for archived commands; DefaultEvalRunner itself is untouched.
+    trajectory_override = (
+        os.environ.get("EVAL_TRAJ_PATH_OVERRIDE")
+        or os.environ.get("STACKCUBE_EVAL_TRAJ_PATH")
+    )
+    task_cls = None
+    original_trajectory_path = None
+    if trajectory_override:
+        from metasim.task.registry import get_task_class
+        task_cls = get_task_class(args.task)
+        original_trajectory_path = task_cls.traj_filepath
+        task_cls.traj_filepath = trajectory_override
+    try:
+        workspace.evaluate(ckpt_path=checkpoint_path)
+    finally:
+        if task_cls is not None:
+            task_cls.traj_filepath = original_trajectory_path
     result = phase_bank.parse_final_stats(run_dir)
+    if bool(getattr(args, "capture_source_records", False)):
+        # The runner only observes actions; DefaultEvalRunner remains the
+        # authority for SuccessOnce.  Persist support tuples after filtering
+        # by that final episode-level outcome, never per-chunk heuristics.
+        success_map = _read_success_map(run_dir)
+        captured = EPISODIC_SOURCE_CAPTURE or []
+        successful_records = [
+            record for record in captured
+            if bool(success_map.get(int(record["episode_id"]), False))
+        ]
+        capture_path = run_dir / "successful_episodic_source_records.pt"
+        torch.save({
+            "records": successful_records,
+            "all_record_count": len(captured),
+            "successful_record_count": len(successful_records),
+            "successful_episode_ids": sorted(
+                episode for episode, success in success_map.items() if success
+            ),
+            "source_depth": float(depth),
+            "selection": str(getattr(args, "qkv_value_mode", "weighted")),
+        }, capture_path)
+        result.update({
+            "captured_record_path": str(capture_path),
+            "captured_all_records": len(captured),
+            "captured_successful_records": len(successful_records),
+            "captured_successful_episodes": int(sum(success_map.values())),
+        })
     result.update({"method": method, "shift_cm": shift_cm, "depth": depth, "elapsed_seconds": time.perf_counter() - started, "run_dir": str(run_dir)})
     return result
 
