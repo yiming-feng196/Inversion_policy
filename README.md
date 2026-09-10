@@ -1,45 +1,50 @@
-# Inversion Policy: Frozen Flow Latent Experiments
+# Frozen Flow Inversion Latent Experiments
 
-This repository contains the reproducible code for studying expert inversion
-latents under a frozen Flow Matching policy. The experiments test latent
-relevance, global distribution structure, local behavior-specific regions, and
-directional behavioral geometry.
+本仓库提供冻结 Flow Matching policy 下的 expert inversion latent 实验代码。代码依赖原始 MomentVLA/RoboVerse 工程、checkpoint、数据集和 latent cache；这些大文件不提交到 Git。
 
-The code does not include the MomentVLA/RoboVerse checkout, datasets,
-checkpoints, latent caches, or generated results. Those assets must be supplied
-through the command-line arguments.
+## 代码文件
 
-## Core scripts
+| 文件 | 作用 |
+|---|---|
+| `flow_latent_predictor_common.py` | 公共底层接口：加载冻结 Flow、执行可微 forward sampling、读取 cache、处理 condition 和 action normalization，并检查模型完整性。 |
+| `prepare_inverted_latent_dataset.py` | 将 expert action chunk 通过 Flow reverse integration 反演为 `z_star`，生成可断点续跑的 train/validation cache。 |
+| `conditional_latent_relevance_test.py` | 在固定 condition 下比较 inversion、单次 Gaussian random 和 Random Oracle Best@100 的 action error。 |
+| `native_cycle_vs_expert_distribution_audit.py` | 构造并审计 `z_native`、`z_cycle`、`z_expert`，计算 covariance spectrum、effective rank、whitening 和径向统计。 |
+| `local_latent_region_test.py` | 以 `z_star` 为中心进行不同半径的局部 Gaussian sampling，并与全局 N(0,I) sampling 比较。 |
+| `directional_latent_geometry_test.py` | 在相同 latent 扰动长度下比较 radial outward、radial inward 和随机 tangential direction。 |
+| `latent_geometry_figures.py` | 计算冻结 Flow 的精确 Jacobian、`J_F^T J_F` 的切向谱，以及 radial/high-sensitivity 和 low/high-sensitivity 行为网格。 |
 
-- `flow_latent_predictor_common.py`: frozen Flow loading, differentiable forward
-  sampling, cache loading, normalization, and integrity helpers.
-- `prepare_inverted_latent_dataset.py`: reverse-integrates expert action chunks
-  to create a resumable `z_star` train/validation cache.
-- `conditional_latent_relevance_test.py`: compares expert inversion with one
-  Gaussian sample and Random Oracle Best@100 under fixed conditions.
-- `native_cycle_vs_expert_distribution_audit.py`: audits native, cycle, and
-  expert latent distributions, covariance spectra, effective rank, and
-  whitening statistics.
-- `local_latent_region_test.py`: compares local sampling around `z_star` with
-  global Gaussian sampling.
-- `directional_latent_geometry_test.py`: compares equal-length radial outward,
-  radial inward, and tangential perturbations.
-- `latent_geometry_figures.py`: computes the exact local Flow Jacobian, tangent
-  sensitivity spectrum, and radial/tangential behavior grids. Its numerical
-  outputs can be retained independently of its optional plotting code.
+所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
-All experiments use a frozen Flow checkpoint and 200-step forward/reverse Flow
-integration. The Flow parameters are never updated.
+## 当前实验结论
 
-## Environment
+我们研究了从 expert action 反演得到的 latent 是否包含与行为相关的结构。实验结果支持以下结论。
 
-Install the Python dependencies listed in `requirements.txt`. The original
-MomentVLA/RoboVerse source tree is also required because the scripts instantiate
-its policy and Flow matcher.
+**1. Expert inversion latent 与具体行为高度相关。** 在 1915 个 validation conditions 上，inversion 的 executed action error 为 **0.0101**，单次 Gaussian random 为 **0.2629**。即使允许 Gaussian random 采样 100 次并事后根据真实 expert action 选择最优样本，Random Oracle Best@100 仍为 **0.0914**。因此 inversion 分别比 random 和 Oracle Best@100 低约 **26×** 和 **9×**，说明 `z_star` 不是任意先验样本，而是包含当前行为信息的条件 latent。
 
-## Typical workflow
+**2. Expert inversion latent 存在明显的二阶结构重分配。** 以 native latent covariance 为参照，expert/native eigenvalue ratio 在 leading modes 中显著大于 1，在 trailing modes 中显著小于 1，表明 expert variance 被集中到更少的 dominant directions。对应的谱熵 effective rank 从 native 的 **142.7** 降至 cycle 的 **137.9**，再降至 expert 的 **94.2**。
 
-First build the inversion cache:
+**3. 这种结构不只是 covariance 差异。** 使用 expert training covariance whitening 后，expert 的 `||z_w||^2` 标准差为 **37.86**，而 Gaussian 理论 `chi^2_144` 的标准差为 **16.97**；QQ 曲线在中心和 upper tail 均偏离 `y=x`。因此消除二阶 covariance 后，expert inversion latent 仍保留 higher-order non-Gaussian structure。
+
+**4. Behavior-specific latent region 具有有限半径。** 以 `z_star` 为中心的局部 sampling 在 RMS 半径 sigma = 0.05、0.1、0.25、0.5 下的平均 action error 分别约为 **0.0132、0.0196、0.0472、0.1389**，均低于 global Gaussian 的 **0.2629**；当 sigma = 1.0 时 error 上升至约 **0.8944**。这支持“存在 behavior-specific latent region”，而不是只有一个孤立的特殊 latent point。
+
+**5. 局部区域具有 radial asymmetry 和 directional anisotropy。** 在相同 latent 扰动长度下，RMS 半径 0.75 时，radial outward、radial inward 和 tangential perturbation 的平均 action error 约为 **2.178、0.189、0.378**。此外，冻结 Flow 在 `z_star` 处的 `J_F^T J_F` 显示不同切向方向具有显著不同的 behavioral sensitivity。因此局部 behavior region 既不是以 `z_star` 为中心的圆，也不是各向同性 Gaussian ball，而是一个具有方向性和径向不对称的区域。
+
+总体而言，实验形成了如下证据链：
+
+```text
+variance concentration
+        →
+higher-order non-Gaussian structure
+        →
+behavior-specific local geometry
+```
+
+这为后续的 `localize → locally sample/refine → decode` 方法提供了直接实验依据。
+
+## 基本运行方式
+
+先生成 inversion cache：
 
 ```bash
 python prepare_inverted_latent_dataset.py \
@@ -49,27 +54,4 @@ python prepare_inverted_latent_dataset.py \
   --cache /path/to/inversion_cache
 ```
 
-Then run the validation scripts with the same `--repo`, `--checkpoint`, and
-`--cache` arguments:
-
-```bash
-python conditional_latent_relevance_test.py \
-  --repo /path/to/MomentVLA-main \
-  --checkpoint /path/to/30.ckpt \
-  --cache /path/to/inversion_cache \
-  --output-dir /path/to/relevance_output
-```
-
-The other analysis scripts expose the same common arguments. Keep checkpoints,
-datasets, caches, and generated outputs outside Git.
-
-## Current validated findings
-
-The validated experiments show that:
-
-1. Expert inversion is strongly behaviorally relevant under fixed conditions.
-2. Expert variance is concentrated into fewer dominant latent modes.
-3. Whitening removes second-order covariance structure but leaves higher-order
-   non-Gaussian radial structure.
-4. Around an inverted latent, finite-radius behavior forms an asymmetric and
-   directionally anisotropic local region.
+其余脚本使用相同的 `--repo`、`--checkpoint` 和 `--cache` 参数。依赖见 `requirements.txt`；数据集、checkpoint、cache 和生成结果应保存在仓库之外。
