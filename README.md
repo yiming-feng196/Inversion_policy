@@ -17,6 +17,7 @@
 | `evaluate_behavior_region_policy.py` | 评估 BRL anchor、isotropic local、tangent local 与 tangent + norm projection 的 Stage-2 初始化几何。 |
 | `evaluate_behavior_region_rollout.py` | 为现有 RoboVerse rollout wrapper 提供 paired seed/scenario 的 clean 与 OOD 闭环评测 harness。 |
 | `evaluate_region_warmstart_speed.py` | 为 NFE sweep、intermediate-state warm-start 和同步 GPU wall-clock 测速提供统一 harness。 |
+| `temporal_region_continuity_test.py` | 对同一 episode 的相邻 policy update 比较 current inversion、previous-latent reuse、Gaussian 和 observation retrieval，验证 behavior region 是否可追踪。 |
 
 所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
