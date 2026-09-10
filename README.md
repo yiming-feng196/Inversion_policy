@@ -13,6 +13,10 @@
 | `local_latent_region_test.py` | 以 `z_star` 为中心进行不同半径的局部 Gaussian sampling，并与全局 N(0,I) sampling 比较。 |
 | `directional_latent_geometry_test.py` | 在相同 latent 扰动长度下比较 radial outward、radial inward 和随机 tangential direction。 |
 | `latent_geometry_figures.py` | 计算冻结 Flow 的精确 Jacobian、`J_F^T J_F` 的切向谱，以及 radial/high-sensitivity 和 low/high-sensitivity 行为网格。 |
+| `behavior_region_localizer.py` | 仅用 train episodes 构建 Behavior Region Bank，进行 50/200-step teacher ranking，训练 behavior-supervised region locator，并在 validation 上比较 retrieval、Gaussian 和 candidate oracle。 |
+| `evaluate_behavior_region_policy.py` | 评估 BRL anchor、isotropic local、tangent local 与 tangent + norm projection 的 Stage-2 初始化几何。 |
+| `evaluate_behavior_region_rollout.py` | 为现有 RoboVerse rollout wrapper 提供 paired seed/scenario 的 clean 与 OOD 闭环评测 harness。 |
+| `evaluate_region_warmstart_speed.py` | 为 NFE sweep、intermediate-state warm-start 和同步 GPU wall-clock 测速提供统一 harness。 |
 
 所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
@@ -44,6 +48,29 @@ behavior-specific local geometry
 ```
 
 这为后续的 `localize → locally sample/refine → decode` 方法提供了直接实验依据。
+
+## 下一阶段 BRL 实验
+
+`behavior_region_localizer.py` 的 bank 只包含 train-episode inversion latent。Locator 使用 observation feature 学习行为兼容区域的 soft teacher distribution；validation expert action 只用于离线计算 action error，不能进入 bank 或推理输入。默认先用 50-step Flow 生成训练标签，并用至少 5000 个 candidate pairs 与 200-step teacher 比较；Spearman 低于 0.90 时自动回退到 100 或 200 steps。
+
+生成可用于 warm-start 的 cache 时，增加 `--save-intermediate-states`；该选项同时保存当前 proprio 和 `x_tau_025/050/075`。
+
+```bash
+python behavior_region_localizer.py \
+  --repo /path/to/MomentVLA-main \
+  --checkpoint /path/to/30.ckpt \
+  --cache /path/to/inversion_cache \
+  --output-dir /path/to/behavior_region_localization/stage1_locator
+
+python evaluate_behavior_region_policy.py \
+  --repo /path/to/MomentVLA-main \
+  --checkpoint /path/to/30.ckpt \
+  --cache /path/to/inversion_cache \
+  --stage1-dir /path/to/behavior_region_localization/stage1_locator \
+  --output-dir /path/to/behavior_region_localization/stage2_geometry
+```
+
+正式 Flow validation 固定 200 steps；rollout 和测速脚本需要通过 `--runner module:function` 接入现有环境 wrapper，因此本仓库不会虚构 simulator API。
 
 ## 基本运行方式
 

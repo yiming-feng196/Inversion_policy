@@ -19,6 +19,8 @@ def main():
     p.add_argument('--history', type=int, default=12)
     p.add_argument('--max-per-split', type=int, default=0)
     p.add_argument('--reconstruction-threshold', type=float, default=0.1)
+    p.add_argument('--save-intermediate-states', action='store_true',
+                   help='Save reverse Flow states x_tau at tau=.25,.50,.75 for warm-start experiments')
     p.add_argument('--val-ratio', type=float, default=0.2,
                    help='Episode-level validation ratio used when creating a new cache')
     a = p.parse_args()
@@ -56,6 +58,7 @@ def main():
                      forward_steps=a.forward_steps, reverse_steps=a.reverse_steps,
                      max_per_split=a.max_per_split, batch_size=a.batch_size,
                      reconstruction_threshold=a.reconstruction_threshold,
+                     save_intermediate_states=a.save_intermediate_states,
                      val_ratio=a.val_ratio,
                      train_episodes=np.flatnonzero(train).tolist(), val_episodes=np.flatnonzero(val).tolist(),
                      solver='native Euler sample/reverse_sample, t=0 to 1 / 1 to 0',
@@ -122,18 +125,31 @@ def main():
                 assert np.array_equal(positions[-nobs:], np.clip(np.arange(current-nobs+1,current+1),start,ends[ep]-1))
                 action_positions = np.clip(np.arange(bs-ss, bs-ss+horizon),bs,be-1)
                 action = np.stack([root['data']['action'][int(i)] for i in action_positions])
-                rows.append(dict(sample_index=torch.tensor(begin+offset), sampler_index=torch.tensor(sample),
+                row = dict(sample_index=torch.tensor(begin+offset), sampler_index=torch.tensor(sample),
                                  condition_id=torch.tensor(current), observation_indices=torch.tensor(positions), episode=torch.tensor(ep), split=torch.tensor(split),
-                                 expert_raw=torch.tensor(action).float(), context=features[positions]))
+                                 proprio=torch.tensor(root['data']['state'][current]).float(),
+                                 expert_raw=torch.tensor(action).float(), context=features[positions])
+                rows.append(row)
             d = {k: torch.stack([r[k] for r in rows]) for k in rows[0]}
             c = d['context'][:,-nobs:].flatten(1).to(a.device)
             with torch.no_grad():
                 expert = policy.normalizer['action'].normalize(d['expert_raw'].to(a.device))
-                z = matcher.reverse_sample(policy.model, start=expert, num_steps=a.reverse_steps, global_cond=c)
+                if a.save_intermediate_states:
+                    z, (_, reverse_trace) = matcher.reverse_sample(
+                        policy.model, start=expert, num_steps=a.reverse_steps,
+                        return_traces=True, global_cond=c)
+                else:
+                    z = matcher.reverse_sample(policy.model, start=expert, num_steps=a.reverse_steps, global_cond=c)
                 reconstructed = forward_flow(policy, matcher, z, c, a.forward_steps)
             d.update(condition=c.cpu(), expert=expert.cpu(), z_star=z.cpu(),
                      z_norm=z.flatten(1).norm(dim=1).cpu(),
                      reconstruction_rmse=(reconstructed-expert).square().flatten(1).mean(1).sqrt().cpu())
+            if a.save_intermediate_states:
+                # reverse_trace[k] is x(t=1-k/reverse_steps), so map the
+                # requested forward-flow times back to reverse-trace indices.
+                for tau, key in ((0.25, 'x_tau_025'), (0.50, 'x_tau_050'), (0.75, 'x_tau_075')):
+                    trace_index = int(round((1.0 - tau) * a.reverse_steps))
+                    d[key] = reverse_trace[trace_index].float()
             if not all(torch.isfinite(v).all() for v in d.values()):
                 atomic_save(d, out/f'nonfinite_{begin}.pt')
                 raise ValueError('Nonfinite inversion retained for inspection; cannot train')
