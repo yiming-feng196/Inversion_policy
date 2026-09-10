@@ -29,6 +29,9 @@
 **4. Behavior-specific latent region 具有有限半径。** 以 `z_star` 为中心的局部 sampling 在 RMS 半径 sigma = 0.05、0.1、0.25、0.5 下的平均 action error 分别约为 **0.0132、0.0196、0.0472、0.1389**，均低于 global Gaussian 的 **0.2629**；当 sigma = 1.0 时 error 上升至约 **0.8944**。这支持“存在 behavior-specific latent region”，而不是只有一个孤立的特殊 latent point。
 
 **5. 局部区域具有 radial asymmetry 和 directional anisotropy。** 在相同 latent 扰动长度下，RMS 半径 0.75 时，radial outward、radial inward 和 tangential perturbation 的平均 action error 约为 **2.178、0.189、0.378**。此外，冻结 Flow 在 `z_star` 处的 `J_F^T J_F` 显示不同切向方向具有显著不同的 behavioral sensitivity。因此局部 behavior region 既不是以 `z_star` 为中心的圆，也不是各向同性 Gaussian ball，而是一个具有方向性和径向不对称的区域。
+<img width="3380" height="1404" alt="tangential_anisotropy_low_high" src="https://github.com/user-attachments/assets/ce31f482-5e63-4cd0-af7f-86def89fe692" />
+<img width="1820" height="1612" alt="local_behavior_region_radial_high" src="https://github.com/user-attachments/assets/2959e0bc-0abf-4d42-8947-ad054d9de308" />
+<img width="4760" height="1540" alt="global_latent_structure_main" src="https://github.com/user-attachments/assets/4a926005-ec49-4294-a63f-372eba98f25f" />
 
 总体而言，实验形成了如下证据链：
 
