@@ -103,7 +103,8 @@ def check_settings(
     policy: nn.Module,
     args: argparse.Namespace,
 ) -> None:
-    if args.reference_steps != 200:
+    formal_steps = getattr(args, "reference_steps", getattr(args, "forward_steps", None))
+    if formal_steps != 200:
         raise ValueError("formal BRL validation must use --reference-steps 200")
     if tuple(data["z_star"].shape[1:]) != (16, 9):
         raise ValueError(f"expected latent shape [16,9], got {tuple(data['z_star'].shape[1:])}")
@@ -605,7 +606,12 @@ def evaluate_retrieval(
     metrics = {
         "inversion_lower_bound": {"mean": float(inversion_errors.mean())},
         "global_gaussian_single": {"mean": float(global_errors.mean())},
-        "candidate_pool_oracle": {"mean": float(pool_errors.min(1).mean()), "p90": float(np.quantile(pool_errors.min(1), .9))},
+        "candidate_pool_oracle": {
+            "mean": float(pool_errors.min(1).mean()),
+            "p90": float(np.quantile(pool_errors.min(1), .9)),
+            "best@4_mean": float(pool_errors[:, :4].min(1).mean()),
+            "best@8_mean": float(pool_errors[:, :8].min(1).mean()),
+        },
         "observation_retrieval": _method_summary(obs_errors, np.arange(8)[None].repeat(len(val_ids), axis=0), epsilon),
         "proprio_retrieval": _method_summary(prop_errors, np.arange(8)[None].repeat(len(val_ids), axis=0), epsilon),
         "random_train_bank": _method_summary(random_errors, np.arange(8)[None].repeat(len(val_ids), axis=0), epsilon),
