@@ -23,10 +23,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--methods",
-        default="gaussian,previous_region_reuse,temporal_tracker,temporal_tangent_norm",
+        default="gaussian,previous_region_reuse,gated_tracker,gated_tangent_norm",
         help="deployable methods; the previous-region methods use only causal executed chunks",
     )
-    parser.add_argument("--scenarios", default="clean,shift_2cm,shift_3cm,shift_5cm")
+    parser.add_argument("--scenarios", default="shift_0cm,shift_1cm,shift_2cm,shift_3cm,shift_5cm")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--action-horizon", type=int, default=16)

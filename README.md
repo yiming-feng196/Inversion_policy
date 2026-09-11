@@ -19,6 +19,7 @@
 | `evaluate_region_warmstart_speed.py` | 为 NFE sweep、intermediate-state warm-start 和同步 GPU wall-clock 测速提供统一 harness。 |
 | `temporal_region_continuity_test.py` | 对同一 episode 的相邻 policy update 比较 current inversion、previous-latent reuse、Gaussian 和 observation retrieval，验证 behavior region 是否可追踪。 |
 | `behavior_region_tracker.py` | 下一阶段方法：从上一时刻已执行 action chunk 反演得到 `z_prev`，再根据上一/当前 causal observation 预测局部 residual，并提供 tangent 与 norm-preserving geometry、offline 训练评估和 online 推理接口。 |
+| `evaluate_region_staleness.py` | 在 0/1/2/3/5 cm target relocation 下统计 `E_reuse` 与 current inversion error，定位旧 behavior region 何时失效。 |
 
 所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
@@ -65,7 +66,16 @@ previous executed action chunk + previous condition
         → current action chunk
 ```
 
-`behavior_region_tracker.py` 中的 tracker 只学习 residual movement，不回归整个绝对 latent location。`reuse` 是无学习的 previous-region baseline；`tracker`、`tangent` 和 `tangent_norm` 用于检验当前 observation 是否需要局部修正。`tangent_norm` 将预测更新投影到 `z_prev` 的切空间、限制 RMS 步长，并投影回 anchor norm，以避免 radial outward 的破坏性移动。
+`behavior_region_tracker.py` 的默认行为是安全的 previous-region reuse。只有显式启用 `--enable-correction` 后，才训练 residual 和 staleness gate：
+
+```text
+z_prev = F^{-1}(A_{t-1}^{exec} | c_{t-1})
+g = gate(z_prev, c_{t-1}, c_t)
+z_hat = z_prev                         if g is small
+z_hat = Geometry(z_prev + g Δz)         otherwise
+```
+
+gate 的 train label 来自 train episodes 中的 action-space reuse error，而不是 latent Euclidean distance。这样正常 temporal transition 默认保持 `g≈0`；只有当旧 region 在当前 condition 下产生明显行为误差时才允许 correction。`tangent_norm` 将 gated update 投影到 `z_prev` 的切空间、限制 RMS 步长，并投影回 anchor norm，以避免 radial outward 的破坏性移动。
 
 相邻正常时刻的离线诊断由 `temporal_region_continuity_test.py` 提供。如果 previous-latent reuse 明显低于 Gaussian，说明 region 可以沿时间追踪；如果闭环扰动后 reuse error 上升，则应触发重新反演或重新定位。该诊断不把 validation latent 放入 train bank，也不使用 future observation。
 
@@ -74,8 +84,19 @@ python behavior_region_tracker.py \
   --repo /path/to/MomentVLA-main \
   --checkpoint /path/to/30.ckpt \
   --cache /path/to/inversion_cache \
-  --output-dir /path/to/behavior_region_localization/stage1_tracking \
-  --geometry tangent_norm
+  --output-dir /path/to/behavior_region_localization/stage1_tracking
+```
+
+先运行默认 reuse 版本验证 staleness；只有在 0/1/2/3/5 cm relocation 实验确认旧 region 会失效后，再增加 `--enable-correction --geometry tangent_norm`。
+
+闭环 staleness runner 需要返回每个 policy update 的 `e_reuse` 和 `e_current`：
+
+```bash
+python evaluate_region_staleness.py \
+  --runner your_rollout_module:run \
+  --output-dir /path/to/behavior_region_localization/stage3_staleness \
+  --shifts-cm 0,1,2,3,5 \
+  --seeds 0,1,2
 ```
 
 正式 validation 固定 forward/reverse 200 steps。在线 wrapper 使用 `load_tracker` 和 `track_from_executed_chunk`：传入上一段完整 action chunk、上一时刻 condition、上一/当前 causal encoded context，得到 `z_prev` 与当前 Flow 初始化 `z_init`。动作与 observation 的真实执行接口由 RoboVerse rollout wrapper 提供。

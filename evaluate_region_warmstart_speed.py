@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--methods",
-        default="gaussian,previous_region_reuse,temporal_tangent_norm,temporal_warmstart",
+        default="gaussian,previous_region_reuse,gated_tangent_norm,temporal_warmstart",
     )
     parser.add_argument("--nfes", default="4,8,16,32,64,200")
     parser.add_argument("--taus", default="0.25,0.50,0.75")

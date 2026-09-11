@@ -16,9 +16,14 @@ also reports the decisive continuity baselines:
 * old observation nearest-neighbour retrieval, and
 * the learned local tracker.
 
-The tracker is deliberately a residual predictor.  Geometry is applied after
-prediction, so ``tangent`` and ``tangent_norm`` cannot make a destructive
-radial move.  The Flow is frozen throughout.
+The default policy is deliberately a no-op correction:
+
+    invert -> reuse -> detect staleness -> correct only when needed
+
+The residual and gate are opt-in with ``--enable-correction``.  Geometry is
+applied after gate multiplication, so a reliable previous region is reused
+exactly and ``tangent_norm`` cannot make a destructive radial move.  The Flow
+is frozen throughout.
 """
 from __future__ import annotations
 
@@ -74,9 +79,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--geometry",
         choices=("reuse", "tracker", "tangent", "tangent_norm"),
-        default="tangent_norm",
-        help="local update used for the tracker evaluation",
+        default="reuse",
+        help="local update used after the staleness gate fires",
     )
+    parser.add_argument(
+        "--enable-correction",
+        action="store_true",
+        help="train/use the residual and staleness gate; default is safe previous-region reuse",
+    )
+    parser.add_argument(
+        "--staleness-quantile",
+        type=float,
+        default=0.95,
+        help="train-only quantile of normal reuse error used as the stale threshold",
+    )
+    parser.add_argument("--staleness-temperature", type=float, default=0.01)
     parser.add_argument("--max-train-pairs", type=int, default=0)
     parser.add_argument("--max-val-pairs", type=int, default=0)
     parser.add_argument("--global-samples", type=int, default=1)
@@ -220,6 +237,30 @@ class TemporalRegionTracker(nn.Module):
         return y.reshape(-1, *self.output_shape)
 
 
+class StalenessGate(nn.Module):
+    """Predict whether the previous region is still reliable.
+
+    The gate is trained against a train-only reuse-error teacher.  At
+    inference it receives only causal context and the previous source latent;
+    the expert action is never an input.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int,
+                 input_mean: torch.Tensor, input_std: torch.Tensor):
+        super().__init__()
+        self.register_buffer("input_mean", input_mean.float())
+        self.register_buffer("input_std", input_std.float().clamp_min(1e-5))
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        x = (features.float() - self.input_mean) / self.input_std
+        return torch.sigmoid(self.net(x)).squeeze(-1)
+
+
 def load_tracker(path: str | Path, device: str = "cpu") -> TemporalRegionTracker:
     """Load a trained residual tracker without touching the Flow checkpoint."""
     payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -230,6 +271,18 @@ def load_tracker(path: str | Path, device: str = "cpu") -> TemporalRegionTracker
         int(payload["hidden_dim"]),
         state["input_mean"], state["input_std"],
         state["target_mean"], state["target_std"],
+    )
+    model.load_state_dict(state, strict=True)
+    return model.to(device).eval()
+
+
+def load_gate(path: str | Path, device: str = "cpu") -> StalenessGate:
+    """Load a train-only staleness gate."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    state = payload["state_dict"]
+    model = StalenessGate(
+        int(payload["input_dim"]), int(payload["hidden_dim"]),
+        state["input_mean"], state["input_std"],
     )
     model.load_state_dict(state, strict=True)
     return model.to(device).eval()
@@ -248,28 +301,37 @@ def invert_executed_chunk(policy, matcher, action_raw: torch.Tensor,
 def track_from_executed_chunk(
     policy,
     matcher,
-    tracker: TemporalRegionTracker,
+    tracker: TemporalRegionTracker | None,
+    gate: StalenessGate | None,
     action_raw: torch.Tensor,
     previous_condition: torch.Tensor,
     previous_context: torch.Tensor,
     current_context: torch.Tensor,
     reverse_steps: int = 200,
-    geometry: str = "tangent_norm",
+    geometry: str = "reuse",
     max_step_rms: float = 0.25,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Online BRL successor: invert the executed chunk, then track locally.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Online successor: invert, reuse, and correct only when stale.
 
-    Returns ``(z_prev, z_current_init)``.  ``action_raw`` is the complete
-    ``[B,16,9]`` chunk used by the policy execution wrapper; no expert action
-    or future observation is required.
+    Returns ``(z_prev, z_current_init, gate)``.  With no trained tracker/gate
+    this function is exactly previous-region reuse.  ``action_raw`` is the
+    complete ``[B,16,9]`` chunk used by the policy execution wrapper; no
+    expert action or future observation is required.
     """
     z_prev = invert_executed_chunk(
         policy, matcher, action_raw, previous_condition, reverse_steps
     )
+    if tracker is None or gate is None:
+        return z_prev, z_prev.clone(), torch.zeros(z_prev.shape[0], device=z_prev.device)
     features = build_tracker_features(z_prev, previous_context, current_context)
-    delta = tracker(features.to(next(tracker.parameters()).device)).to(z_prev.device)
-    z_init = geometry_update(z_prev, delta, geometry, max_step_rms)
-    return z_prev, z_init
+    tracker_device = next(tracker.parameters()).device
+    features_device = features.to(tracker_device)
+    delta = tracker(features_device).to(z_prev.device)
+    gate_value = gate(features_device).to(z_prev.device)
+    z_init = geometry_update(
+        z_prev, delta * gate_value.view(-1, 1, 1), geometry, max_step_rms
+    )
+    return z_prev, z_init, gate_value
 
 
 def paired_ci(values: np.ndarray) -> list[float]:
@@ -324,6 +386,77 @@ def train_tracker(
     return model, history
 
 
+def train_staleness_gate(
+    args: argparse.Namespace,
+    data: dict,
+    policy: nn.Module,
+    matcher,
+    pairs: torch.Tensor,
+    scale: torch.Tensor,
+    device: str,
+    output: Path,
+) -> tuple[StalenessGate, dict, list[dict]]:
+    """Train a gate from train-only action-space reuse errors.
+
+    The teacher is deliberately not latent distance.  A pair is stale when
+    decoding ``z_prev`` under the current condition produces unusually large
+    executed-action error.  The expert action is used only to construct this
+    offline train label.
+    """
+    previous, current = pairs[:, 0], pairs[:, 1]
+    features = tracker_features(data, previous, current)
+    z_prev = data["z_star"][previous].float()[:, None]
+    reuse_error = decode_direct_errors(
+        policy, matcher, data, current, z_prev, scale,
+        args.forward_steps, device, args.query_batch_size, args.flow_batch_size,
+    )[:, 0]
+    threshold = float(np.quantile(reuse_error, args.staleness_quantile))
+    temperature = max(float(args.staleness_temperature), 1e-6)
+    targets = 1.0 / (1.0 + np.exp(-(reuse_error - threshold) / temperature))
+    model = StalenessGate(
+        features.shape[-1], args.hidden_dim,
+        features.mean(0), features.std(0, unbiased=False),
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    generator = torch.Generator().manual_seed(args.seed + 83)
+    history = []
+    target_tensor = torch.as_tensor(targets, dtype=torch.float32)
+    for epoch in range(args.train_epochs):
+        order = torch.randperm(len(pairs), generator=generator)
+        losses = []
+        for begin in range(0, len(order), args.batch_size):
+            ids = order[begin:begin + args.batch_size]
+            prediction = model(features[ids].to(device))
+            loss = F.mse_loss(prediction, target_tensor[ids].to(device))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        row = {"epoch": epoch + 1, "loss": float(np.mean(losses))}
+        history.append(row)
+        print(json.dumps({"gate": row}), flush=True)
+    atomic_save({
+        "state_dict": model.state_dict(),
+        "input_dim": int(features.shape[-1]),
+        "hidden_dim": args.hidden_dim,
+        "staleness_threshold": threshold,
+        "staleness_quantile": args.staleness_quantile,
+        "staleness_temperature": temperature,
+        "train_reuse_error_mean": float(reuse_error.mean()),
+        "train_reuse_error_p95": float(np.quantile(reuse_error, .95)),
+    }, output / "gate.pt")
+    write_rows(output / "gate_training.csv", history)
+    info = {
+        "threshold": threshold,
+        "quantile": args.staleness_quantile,
+        "temperature": temperature,
+        "reuse_error_mean": float(reuse_error.mean()),
+        "reuse_error_p95": float(np.quantile(reuse_error, .95)),
+        "teacher_gate_positive_fraction": float(np.mean(targets > 0.5)),
+    }
+    return model, info, history
+
+
 @torch.no_grad()
 def verify_executed_inversion(args, data, policy, matcher, pairs, device) -> dict:
     count = min(args.verify_executed_inversion, len(pairs))
@@ -349,35 +482,43 @@ def evaluate(
     data: dict,
     policy: nn.Module,
     matcher,
-    tracker: TemporalRegionTracker,
+    tracker: TemporalRegionTracker | None,
+    gate: StalenessGate | None,
     pairs: torch.Tensor,
     scale: torch.Tensor,
     device: str,
     bank: dict | None,
 ) -> tuple[list[dict], dict]:
     previous, current = pairs[:, 0], pairs[:, 1]
-    features = tracker_features(data, previous, current)
-    predicted_delta = []
-    for begin in range(0, len(pairs), args.batch_size):
-        predicted_delta.append(tracker(features[begin:begin + args.batch_size].to(device)).cpu())
-    predicted_delta = torch.cat(predicted_delta)
     z_prev = data["z_star"][previous].float()
     z_current = data["z_star"][current].float()
-    z_tracker = geometry_update(z_prev, predicted_delta, args.geometry, args.max_step_rms)
-    z_tangent = geometry_update(z_prev, predicted_delta, "tangent", args.max_step_rms)
-    z_tangent_norm = geometry_update(z_prev, predicted_delta, "tangent_norm", args.max_step_rms)
+    if tracker is None or gate is None:
+        predicted_delta = torch.zeros_like(z_prev)
+        gate_value = torch.zeros(len(pairs), dtype=torch.float32)
+    else:
+        features = tracker_features(data, previous, current)
+        predicted_delta_parts = []
+        gate_parts = []
+        tracker.eval()
+        gate.eval()
+        tracker_device = next(tracker.parameters()).device
+        for begin in range(0, len(pairs), args.batch_size):
+            feature_batch = features[begin:begin + args.batch_size].to(tracker_device)
+            predicted_delta_parts.append(tracker(feature_batch).cpu())
+            gate_parts.append(gate(feature_batch).cpu())
+        predicted_delta = torch.cat(predicted_delta_parts)
+        gate_value = torch.cat(gate_parts)
+    gated_delta = predicted_delta * gate_value.view(-1, 1, 1)
+    z_gated = geometry_update(z_prev, gated_delta, args.geometry, args.max_step_rms)
     generator = torch.Generator().manual_seed(args.seed + 109)
     z_gaussian = torch.randn(
         (len(pairs), args.global_samples, *z_prev.shape[1:]), generator=generator
     )
-    q = torch.arange(len(pairs), dtype=torch.long)
     errors = {}
     for name, z in (
         ("current", z_current[:, None]),
         ("reuse", z_prev[:, None]),
-        ("tracker", z_tracker[:, None]),
-        ("tangent", z_tangent[:, None]),
-        ("tangent_norm", z_tangent_norm[:, None]),
+        ("gated", z_gated[:, None]),
         ("gaussian", z_gaussian),
     ):
         errors[name] = decode_direct_errors(
@@ -402,9 +543,10 @@ def evaluate(
             "current_timestep": int(data["condition_id"][curr_id]),
             "latent_step_rms": float(_rms(z_current[i:i + 1] - z_prev[i:i + 1])[0]),
             "predicted_step_rms": float(_rms(predicted_delta[i:i + 1])[0]),
-            "predicted_step_after_geometry_rms": float(_rms(z_tracker[i:i + 1] - z_prev[i:i + 1])[0]),
+            "gate": float(gate_value[i]),
+            "gated_step_rms": float(_rms(z_gated[i:i + 1] - z_prev[i:i + 1])[0]),
             "latent_norm_prev": float(z_prev[i].flatten().norm()),
-            "latent_norm_tracker": float(z_tracker[i].flatten().norm()),
+            "latent_norm_gated": float(z_gated[i].flatten().norm()),
         }
         for name, values in errors.items():
             row[f"e_{name}"] = float(values[i].mean())
@@ -420,7 +562,7 @@ def evaluate(
             "p90": float(np.quantile(values, .90)),
             "ci95": paired_ci(values),
         }
-    for name in ("reuse", "tracker", "tangent", "tangent_norm", "observation_retrieval"):
+    for name in ("reuse", "gated", "observation_retrieval"):
         if name in summary:
             values = np.asarray([r[f"e_{name}"] for r in rows])
             gaussian = np.asarray([r["e_gaussian"] for r in rows])
@@ -429,6 +571,8 @@ def evaluate(
             summary[name]["fraction_better_than_current"] = float(np.mean(values < current_values))
     summary["n_pairs"] = len(rows)
     summary["geometry"] = args.geometry
+    summary["gate_mean"] = float(gate_value.mean())
+    summary["gate_positive_rate"] = float(np.mean(gate_value.numpy() > 0.5))
     return rows, summary
 
 
@@ -452,24 +596,41 @@ def main() -> None:
         val_pairs = val_pairs[:args.max_val_pairs]
     if len(train_pairs) == 0 or len(val_pairs) == 0:
         raise ValueError(f"need train and validation adjacent pairs, got {len(train_pairs)} / {len(val_pairs)}")
-    tracker, history = train_tracker(args, data, train_pairs, output, device)
-    bank = build_bank(data, output) if args.save_bank else None
     scale = action_scale(data)
+    tracker = None
+    gate = None
+    tracker_history = []
+    gate_history = []
+    gate_info = {"enabled": False}
+    if args.enable_correction:
+        tracker, tracker_history = train_tracker(args, data, train_pairs, output, device)
+        gate, gate_info, gate_history = train_staleness_gate(
+            args, data, policy, matcher, train_pairs, scale, device, output
+        )
+        gate_info["enabled"] = True
+    bank = build_bank(data, output) if args.save_bank else None
     inversion_check = verify_executed_inversion(args, data, policy, matcher, val_pairs, device)
-    train_rows, train_summary = evaluate(args, data, policy, matcher, tracker, train_pairs, scale, device, None)
-    val_rows, val_summary = evaluate(args, data, policy, matcher, tracker, val_pairs, scale, device, bank)
+    train_rows, train_summary = evaluate(
+        args, data, policy, matcher, tracker, gate, train_pairs, scale, device, None
+    )
+    val_rows, val_summary = evaluate(
+        args, data, policy, matcher, tracker, gate, val_pairs, scale, device, bank
+    )
     write_rows(output / "tracker_train.csv", train_rows)
     write_rows(output / "tracker_val.csv", val_rows)
     after = digest(policy)
     report = {
         "status": "ok",
         "method": "Temporal Behavior Region Tracking",
+        "correction_enabled": bool(args.enable_correction),
         "train": train_summary,
         "val": val_summary,
+        "staleness_gate": gate_info,
         "geometry": {
             "selected": args.geometry,
             "max_step_rms": args.max_step_rms,
-            "variants_reported": ["reuse", "tracker", "tangent", "tangent_norm"],
+            "decision_rule": "reuse when gate is low; apply local correction only when gate is high",
+            "variants_reported": ["current", "reuse", "gated", "gaussian"],
         },
         "pairs": {"train": len(train_pairs), "val": len(val_pairs)},
         "executed_action_inversion_check": inversion_check,
@@ -482,6 +643,7 @@ def main() -> None:
         "all_flow_parameter_grads_none": all(p.grad is None for p in policy.parameters()),
         "leakage_checks": {
             "tracker_training_pairs": "train episodes only",
+            "gate_training_labels": "train-only reuse action errors",
             "bank": "train episodes only when --save-bank is used",
             "previous_action": "causal previous chunk only",
             "current_expert_action": "offline labels/errors only",
@@ -489,8 +651,9 @@ def main() -> None:
             "phase_input_or_supervision": False,
         },
         "interpretation": {
-            "tracking_support": "reuse and/or local tracker remains below global Gaussian on adjacent normal transitions",
-            "relocalization_trigger": "if reuse rises after a closed-loop change point, refresh the anchor from the executed chunk",
+            "tracking_support": "reuse remains below global Gaussian on adjacent normal transitions",
+            "staleness_test": "evaluate reuse error under 0/1/2/3/5 cm target relocation before enabling correction",
+            "relocalization_trigger": "if reuse rises after a closed-loop change point, open the gate and apply correction or refresh the anchor",
         },
     }
     write_json(report, output / "tracker_report.json")
