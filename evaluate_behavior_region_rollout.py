@@ -1,4 +1,4 @@
-"""Closed-loop BRL evaluation harness.
+"""Closed-loop Temporal Behavior Region Tracking evaluation harness.
 
 The repository does not assume a particular simulator wrapper.  A runner
 callback supplies the existing MomentVLA/RoboVerse environment and policy
@@ -21,7 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner", required=True, help="Python callback module:function")
     parser.add_argument("--stage1-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--methods", default="gaussian,observation_retrieval,brl_anchor,brl_geometry")
+    parser.add_argument(
+        "--methods",
+        default="gaussian,previous_region_reuse,temporal_tracker,temporal_tangent_norm",
+        help="deployable methods; the previous-region methods use only causal executed chunks",
+    )
     parser.add_argument("--scenarios", default="clean,shift_2cm,shift_3cm,shift_5cm")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--episodes", type=int, default=100)

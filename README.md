@@ -18,6 +18,7 @@
 | `evaluate_behavior_region_rollout.py` | 为现有 RoboVerse rollout wrapper 提供 paired seed/scenario 的 clean 与 OOD 闭环评测 harness。 |
 | `evaluate_region_warmstart_speed.py` | 为 NFE sweep、intermediate-state warm-start 和同步 GPU wall-clock 测速提供统一 harness。 |
 | `temporal_region_continuity_test.py` | 对同一 episode 的相邻 policy update 比较 current inversion、previous-latent reuse、Gaussian 和 observation retrieval，验证 behavior region 是否可追踪。 |
+| `behavior_region_tracker.py` | 下一阶段方法：从上一时刻已执行 action chunk 反演得到 `z_prev`，再根据上一/当前 causal observation 预测局部 residual，并提供 tangent 与 norm-preserving geometry、offline 训练评估和 online 推理接口。 |
 
 所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
@@ -48,9 +49,38 @@ higher-order non-Gaussian structure
 behavior-specific local geometry
 ```
 
-这为后续的 `localize → locally sample/refine → decode` 方法提供了直接实验依据。
+这为后续的 `track executed behavior → locally correct → decode` 方法提供了直接实验依据。
 
-## 下一阶段 BRL 实验
+## 下一阶段：Temporal Behavior Region Tracking
+
+仅根据当前 observation 从 train bank 重新检索绝对 region 的 BRL pilot 没有通过 fail-fast：在小规模 validation 上 learned Top-1 没有稳定优于 observation nearest-neighbour。因此方法改为追踪上一时刻已经执行的行为：
+
+```text
+previous executed action chunk + previous condition
+        → frozen Flow reverse
+        → z_prev
+        → (z_prev, previous causal context, current causal context)
+        → local residual / geometry constraint
+        → frozen Flow forward
+        → current action chunk
+```
+
+`behavior_region_tracker.py` 中的 tracker 只学习 residual movement，不回归整个绝对 latent location。`reuse` 是无学习的 previous-region baseline；`tracker`、`tangent` 和 `tangent_norm` 用于检验当前 observation 是否需要局部修正。`tangent_norm` 将预测更新投影到 `z_prev` 的切空间、限制 RMS 步长，并投影回 anchor norm，以避免 radial outward 的破坏性移动。
+
+相邻正常时刻的离线诊断由 `temporal_region_continuity_test.py` 提供。如果 previous-latent reuse 明显低于 Gaussian，说明 region 可以沿时间追踪；如果闭环扰动后 reuse error 上升，则应触发重新反演或重新定位。该诊断不把 validation latent 放入 train bank，也不使用 future observation。
+
+```bash
+python behavior_region_tracker.py \
+  --repo /path/to/MomentVLA-main \
+  --checkpoint /path/to/30.ckpt \
+  --cache /path/to/inversion_cache \
+  --output-dir /path/to/behavior_region_localization/stage1_tracking \
+  --geometry tangent_norm
+```
+
+正式 validation 固定 forward/reverse 200 steps。在线 wrapper 使用 `load_tracker` 和 `track_from_executed_chunk`：传入上一段完整 action chunk、上一时刻 condition、上一/当前 causal encoded context，得到 `z_prev` 与当前 Flow 初始化 `z_init`。动作与 observation 的真实执行接口由 RoboVerse rollout wrapper 提供。
+
+## 旧版 BRL 实验
 
 `behavior_region_localizer.py` 的 bank 只包含 train-episode inversion latent。Locator 使用 observation feature 学习行为兼容区域的 soft teacher distribution；validation expert action 只用于离线计算 action error，不能进入 bank 或推理输入。默认先用 50-step Flow 生成训练标签，并用至少 5000 个 candidate pairs 与 200-step teacher 比较；Spearman 低于 0.90 时自动回退到 100 或 200 steps。
 

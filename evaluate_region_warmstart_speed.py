@@ -1,4 +1,4 @@
-"""NFE and wall-clock benchmark harness for BRL and intermediate-state warm-start.
+"""NFE and wall-clock benchmark harness for tracking and warm-start.
 
 The existing environment-specific policy wrapper is injected through a
 callback ` run(config: dict) -> dict `.  The callback must perform one policy
@@ -24,7 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner", required=True, help="Python callback module:function")
     parser.add_argument("--stage1-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--methods", default="gaussian,brl_anchor,brl_geometry,brl_warmstart")
+    parser.add_argument(
+        "--methods",
+        default="gaussian,previous_region_reuse,temporal_tangent_norm,temporal_warmstart",
+    )
     parser.add_argument("--nfes", default="4,8,16,32,64,200")
     parser.add_argument("--taus", default="0.25,0.50,0.75")
     parser.add_argument("--seeds", default="0,1,2")
@@ -59,7 +62,7 @@ def main() -> None:
     rows = []
     for method in methods:
         for nfe in nfes:
-            for tau in (taus if method == "brl_warmstart" else [None]):
+            for tau in (taus if method == "temporal_warmstart" else [None]):
                 for seed in seeds:
                     config = dict(base_config)
                     config.update({

@@ -86,6 +86,37 @@ def forward_flow(policy, matcher, z, condition, steps, recompute=True):
     return matcher.sample(velocity, tuple(z.shape), z.device, num_steps=steps, start=z, global_cond=condition)
 
 
+@torch.no_grad()
+def reverse_flow(policy, matcher, action, condition, steps, return_traces=False):
+    """Invert a full action chunk into the Flow source space.
+
+    The policy, normalizer and solver are the same ones used by the inversion
+    cache.  Keeping this small adapter in the common module lets online code
+    invert the chunk that was actually executed without duplicating solver or
+    checkpoint loading logic.
+    """
+    if action.ndim != 3 or tuple(action.shape[1:]) != (policy.horizon, policy.action_dim):
+        raise ValueError(
+            f"expected action shape [B,{policy.horizon},{policy.action_dim}], got {tuple(action.shape)}"
+        )
+    if condition.ndim != 2:
+        raise ValueError(f"expected flattened condition [B,C], got {tuple(condition.shape)}")
+    if return_traces:
+        return matcher.reverse_sample(
+            policy.model,
+            start=action,
+            num_steps=steps,
+            return_traces=True,
+            global_cond=condition,
+        )
+    return matcher.reverse_sample(
+        policy.model,
+        start=action,
+        num_steps=steps,
+        global_cond=condition,
+    )
+
+
 class LatentPredictor(nn.Module):
     def __init__(self, context_shape, latent_shape, hidden_dim, mean, std):
         super().__init__()

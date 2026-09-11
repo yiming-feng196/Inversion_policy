@@ -226,7 +226,8 @@ def main() -> None:
             "bank_split": "train_only",
             "previous_latent": "offline continuity diagnostic only",
             "current_validation_expert_action": "used only to compute errors",
-            "future_observation": True,
+            "future_observation": False,
+            "pairing": "same-episode adjacent condition_id and sampler_index only",
         },
     }
     write_json(report, output / "temporal_continuity_report.json")
