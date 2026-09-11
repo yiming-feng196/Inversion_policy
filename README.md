@@ -20,6 +20,8 @@
 | `temporal_region_continuity_test.py` | 对同一 episode 的相邻 policy update 比较 current inversion、previous-latent reuse、Gaussian 和 observation retrieval，验证 behavior region 是否可追踪。 |
 | `behavior_region_tracker.py` | 下一阶段方法：从上一时刻已执行 action chunk 反演得到 `z_prev`，再根据上一/当前 causal observation 预测局部 residual，并提供 tangent 与 norm-preserving geometry、offline 训练评估和 online 推理接口。 |
 | `evaluate_region_staleness.py` | 在 0/1/2/3/5 cm target relocation 下统计 `E_reuse` 与 current inversion error，定位旧 behavior region 何时失效。 |
+| `isaac_region_staleness_runner.py` | 原生 IsaacSim smoke callback：复用现有 PickCube rollout 管线，在 shifted observation 下计算 previous-region reuse 与 current inversion 的 200-step action error；当前明确标注为 recorded-demo replay diagnostic。 |
+| `isaac_reuse_rollout_runner.py` | deployable closed-loop callback：首个 query 使用 Gaussian source，之后只反演并复用上一段实际执行 action chunk 的 latent；用于比较 Gaussian source 与 previous-region reuse 的真实任务成功率。 |
 
 所有实验均使用冻结 checkpoint 和 200 步 forward/reverse Flow integration；Flow 参数不参与更新。
 
@@ -100,6 +102,51 @@ python evaluate_region_staleness.py \
 ```
 
 正式 validation 固定 forward/reverse 200 steps。在线 wrapper 使用 `load_tracker` 和 `track_from_executed_chunk`：传入上一段完整 action chunk、上一时刻 condition、上一/当前 causal encoded context，得到 `z_prev` 与当前 Flow 初始化 `z_init`。动作与 observation 的真实执行接口由 RoboVerse rollout wrapper 提供。
+
+## 当前部署式核心方法：Invert once, reuse temporally
+
+当前原生 IsaacSim 闭环实现验证一个最小、可部署的时间追踪方法：
+
+```text
+A_{t-1}^{exec}
+        → F^{-1}(A_{t-1}^{exec} | c_{t-1})
+        → z_{t-1}
+        → F(z_{t-1} | c_t)
+        → A_t
+```
+
+实现位于 `isaac_reuse_rollout_runner.py`。第一次 policy query 使用 `N(0,I)`；随后在每个 action chunk 结束时，代码收集已经发送给仿真器的真实执行 action，将其写回对应的完整 Flow chunk，再通过 frozen Flow reverse 得到下一次 query 的 source latent。这样 reuse 的输入来自执行结果，不使用 expert action、validation latent、oracle candidate 或 future observation。
+
+`run_isaac_reuse_single.py` 为每个方法和 shift 启动独立 IsaacSim 进程，并将每个 episode 的 success、grasp/lift 状态、episode length、policy query 数量和平均 Flow 推理时间写入 JSON。正式 rollout 固定 `nfe=200`；runner 会拒绝其他 NFE 设置。
+
+示例配置：
+
+```json
+{
+  "repo": "/path/to/MomentVLA-main",
+  "checkpoint": "/path/to/30.ckpt",
+  "device": "cuda:0",
+  "task": "pick_cube",
+  "robot": "franka",
+  "history": 12,
+  "max_steps": 120,
+  "episodes": 50,
+  "method": "previous_region_reuse",
+  "scenario": "shift_2cm",
+  "nfe": 200
+}
+```
+
+运行单个条件：
+
+```bash
+PYTHONPATH=/path/to/Inversion_policy:/path/to/MomentVLA-main \
+python run_isaac_reuse_single.py \
+  --config-json reuse_config.json \
+  --output-json previous_region_reuse_shift_2cm.json
+```
+
+将 `method` 改为 `gaussian` 可得到对照组。两种方法应使用相同 checkpoint、初始状态、shift、episode 数和 NFE；最终比较 success rate，并按 episode 做配对分析。
 
 ## 旧版 BRL 实验
 
