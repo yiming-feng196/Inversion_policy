@@ -6,8 +6,9 @@ condition and becomes the anchor ``z_prev``.  A small residual model receives
 ``(z_prev, c_prev, c_now)`` and predicts a local correction.  It never sees a
 future observation, an expert action, or a validation latent.
 
-The command line program trains the residual tracker on train-episode
-adjacent pairs and evaluates it offline on validation pairs.  The evaluation
+The command line program first trains a staleness gate from train-episode
+reuse errors, then fits the residual only on the train pairs marked stale;
+it evaluates the two-stage policy offline on validation pairs.  The evaluation
 also reports the decisive continuity baselines:
 
 * current inversion (offline lower bound),
@@ -94,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         help="train-only quantile of normal reuse error used as the stale threshold",
     )
     parser.add_argument("--staleness-temperature", type=float, default=0.01)
+    parser.add_argument(
+        "--min-correction-pairs",
+        type=int,
+        default=16,
+        help="minimum train-only stale pairs required before fitting a residual",
+    )
     parser.add_argument("--max-train-pairs", type=int, default=0)
     parser.add_argument("--max-val-pairs", type=int, default=0)
     parser.add_argument("--global-samples", type=int, default=1)
@@ -395,7 +402,7 @@ def train_staleness_gate(
     scale: torch.Tensor,
     device: str,
     output: Path,
-) -> tuple[StalenessGate, dict, list[dict]]:
+) -> tuple[StalenessGate, dict, list[dict], torch.Tensor]:
     """Train a gate from train-only action-space reuse errors.
 
     The teacher is deliberately not latent distance.  A pair is stale when
@@ -454,7 +461,7 @@ def train_staleness_gate(
         "reuse_error_p95": float(np.quantile(reuse_error, .95)),
         "teacher_gate_positive_fraction": float(np.mean(targets > 0.5)),
     }
-    return model, info, history
+    return model, info, history, torch.as_tensor(targets > 0.5, dtype=torch.bool)
 
 
 @torch.no_grad()
@@ -602,12 +609,22 @@ def main() -> None:
     tracker_history = []
     gate_history = []
     gate_info = {"enabled": False}
+    correction_train_pairs = 0
     if args.enable_correction:
-        tracker, tracker_history = train_tracker(args, data, train_pairs, output, device)
-        gate, gate_info, gate_history = train_staleness_gate(
+        gate, gate_info, gate_history, stale_mask = train_staleness_gate(
             args, data, policy, matcher, train_pairs, scale, device, output
         )
         gate_info["enabled"] = True
+        stale_pairs = train_pairs[stale_mask]
+        correction_train_pairs = len(stale_pairs)
+        gate_info["stale_pair_count"] = correction_train_pairs
+        if correction_train_pairs >= args.min_correction_pairs:
+            tracker, tracker_history = train_tracker(
+                args, data, stale_pairs, output, device
+            )
+            gate_info["correction_fitted_on"] = "stale train pairs only"
+        else:
+            gate_info["correction_fitted_on"] = "none; insufficient stale train pairs"
     bank = build_bank(data, output) if args.save_bank else None
     inversion_check = verify_executed_inversion(args, data, policy, matcher, val_pairs, device)
     train_rows, train_summary = evaluate(
@@ -633,6 +650,7 @@ def main() -> None:
             "variants_reported": ["current", "reuse", "gated", "gaussian"],
         },
         "pairs": {"train": len(train_pairs), "val": len(val_pairs)},
+        "correction_train_pairs": correction_train_pairs,
         "executed_action_inversion_check": inversion_check,
         "flow_steps": {"forward": args.forward_steps, "reverse": args.reverse_steps},
         "flow_checkpoint_sha256": sha256(args.checkpoint),
