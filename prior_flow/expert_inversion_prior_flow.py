@@ -68,6 +68,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostic-every", type=int, default=5)
     parser.add_argument("--diagnostic-samples", type=int, default=128)
     parser.add_argument("--prior-inference-steps", type=int, default=16)
+    parser.add_argument(
+        "--train-all",
+        action="store_true",
+        help=(
+            "Train on every cached sample. The cache validation split is retained "
+            "only as an in-distribution training diagnostic, not as a held-out metric."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -318,14 +326,17 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
 
     data, manifest = load_inversion_cache(args.cache)
-    train_indices = torch.where(data["split"] == 0)[0]
+    split_train_indices = torch.where(data["split"] == 0)[0]
     validation_indices = torch.where(data["split"] == 1)[0]
-    if not len(train_indices) or not len(validation_indices):
+    if not len(split_train_indices) or not len(validation_indices):
         raise ValueError("cache must contain non-empty episode-level train and validation splits")
-    if set(data["episode"][train_indices].tolist()) & set(
+    if set(data["episode"][split_train_indices].tolist()) & set(
         data["episode"][validation_indices].tolist()
     ):
         raise ValueError("episode leakage between train and validation splits")
+    train_indices = (
+        torch.arange(len(data["sample_index"])) if args.train_all else split_train_indices
+    )
 
     condition_dim = data["condition"].flatten(1).shape[1]
     latent_shape = tuple(data["z_star"].shape[1:])
@@ -398,6 +409,7 @@ def main() -> None:
         "validation_samples": len(validation_indices),
         "train_episodes": len(set(data["episode"][train_indices].tolist())),
         "validation_episodes": len(set(data["episode"][validation_indices].tolist())),
+        "validation_is_held_out": not args.train_all,
         "steps_per_epoch": steps_per_epoch,
         "total_optimizer_steps": total_steps,
         "condition_dim": condition_dim,
