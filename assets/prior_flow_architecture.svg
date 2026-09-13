@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Expert-Inversion Prior Flow</title>
+  <desc id="desc">Offline inversion, conditional flow matching training, and inference with a learned prior and frozen Action Flow.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#475569"/></marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#6686a8"/></marker>
+    <style>
+      text{font-family:Arial,Helvetica,sans-serif;fill:#1f2a3d}.title{font-size:31px;font-weight:700}.section{font-size:23px;font-weight:700}.label{font-size:20px;font-weight:600}.body{font-size:18px}.small{font-size:16px;fill:#66758a}.math{font-family:Georgia,'Times New Roman',serif;font-size:24px;font-style:italic}.panel{fill:#fff;stroke:#dce2ea;stroke-width:1.5}.data{fill:#f8fafc;stroke:#c7d0db;stroke-width:1.7}.frozen{fill:#edf4fb;stroke:#8ca9c8;stroke-width:1.8}.prior{fill:#eaf5ef;stroke:#70a38a;stroke-width:1.8}.loss{fill:#fff4e8;stroke:#d2aa72;stroke-width:1.8}.flow{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}.cond{fill:none;stroke:#6686a8;stroke-width:1.8;stroke-dasharray:7 6;marker-end:url(#arrowBlue)}
+    </style>
+  </defs>
+  <rect width="1600" height="1000" fill="#ffffff"/>
+  <text x="48" y="52" class="title">Expert-Inversion Prior Flow</text>
+  <rect x="1050" y="31" width="18" height="18" rx="3" class="frozen"/><text x="1078" y="46" class="small">Frozen</text>
+  <rect x="1175" y="31" width="18" height="18" rx="3" class="prior"/><text x="1203" y="46" class="small">Trainable Prior</text>
+  <path d="M1370 40h42" class="cond"/><text x="1423" y="46" class="small">Condition</text>
+
+  <rect x="48" y="80" width="1504" height="242" rx="14" class="panel"/>
+  <text x="74" y="117" class="section">A  Offline expert inversion</text>
+  <text x="1524" y="116" text-anchor="end" class="small">No gradient updates</text>
+  <rect x="88" y="158" width="180" height="78" rx="9" class="data"/><text x="178" y="188" text-anchor="middle" class="label">Observation</text><text x="178" y="220" text-anchor="middle" class="math">o</text>
+  <path d="M268 197h52" class="flow"/>
+  <rect x="322" y="158" width="245" height="78" rx="9" class="frozen"/><text x="444" y="187" text-anchor="middle" class="label">Observation encoder E</text><text x="444" y="216" text-anchor="middle" class="body">from baseline policy</text>
+  <path d="M567 197h77" class="flow"/><text x="609" y="181" text-anchor="middle" class="math">c</text>
+  <rect x="706" y="139" width="248" height="54" rx="8" class="data"/><text x="830" y="173" text-anchor="middle" class="body">Expert action chunk A*</text>
+  <path d="M830 193v28" class="flow"/>
+  <rect x="686" y="223" width="288" height="69" rx="9" class="frozen"/><text x="830" y="251" text-anchor="middle" class="label">Reverse Action Flow F⁻¹θ</text><text x="830" y="280" text-anchor="middle" class="body">numerical integration · 1 → 0</text>
+  <path d="M644 197h16v61h26" class="cond"/>
+  <path d="M974 258h104" class="flow"/><text x="1026" y="241" text-anchor="middle" class="math">z*</text>
+  <rect x="1080" y="214" width="286" height="78" rx="9" class="data"/><text x="1223" y="243" text-anchor="middle" class="label">Detached training cache</text><text x="1223" y="275" text-anchor="middle" class="math">(c, z*)</text>
+  <path d="M655 179v-38h568v73" class="cond"/>
+  <text x="88" y="287" class="small">z* ≈ F⁻¹θ(A* | c) using the same frozen checkpoint that later decodes actions</text>
+
+  <rect x="48" y="342" width="1504" height="310" rx="14" class="panel"/>
+  <text x="74" y="379" class="section">B  Conditional Prior Flow training</text>
+  <text x="1524" y="378" text-anchor="end" class="small">Only φ is updated</text>
+  <rect x="88" y="441" width="220" height="68" rx="9" class="data"/><text x="198" y="469" text-anchor="middle" class="label">Fresh Gaussian</text><text x="198" y="497" text-anchor="middle" class="math">ε ∼ N(0, I)</text>
+  <rect x="88" y="533" width="220" height="68" rx="9" class="data"/><text x="198" y="561" text-anchor="middle" class="label">Cached endpoint</text><text x="198" y="589" text-anchor="middle" class="math">z*</text>
+  <path d="M308 475h78" class="flow"/><path d="M308 567h42v-33h36" class="flow"/>
+  <rect x="388" y="459" width="272" height="112" rx="9" class="data"/><text x="524" y="490" text-anchor="middle" class="label">Probability path</text><text x="524" y="528" text-anchor="middle" class="math">zₜ = (1 − t)ε + tz*</text><text x="524" y="556" text-anchor="middle" class="body">t ∼ U(0, 1)</text>
+  <path d="M660 515h75" class="flow"/><text x="698" y="498" text-anchor="middle" class="small">zₜ, t</text>
+  <rect x="737" y="459" width="268" height="112" rx="9" class="prior"/><text x="871" y="490" text-anchor="middle" class="label">Prior velocity vφ</text><text x="871" y="527" text-anchor="middle" class="math">vφ(zₜ, t, c)</text><text x="871" y="556" text-anchor="middle" class="body">Conditional UNet1D</text>
+  <text x="871" y="425" text-anchor="middle" class="math">cached c</text><path d="M871 432v27" class="cond"/>
+  <path d="M1005 515h91" class="flow"/>
+  <rect x="1098" y="459" width="386" height="112" rx="9" class="loss"/><text x="1291" y="490" text-anchor="middle" class="label">Flow-matching objective</text><text x="1291" y="528" text-anchor="middle" class="math">L = E ‖vφ(zₜ,t,c) − u*‖²</text><text x="1291" y="557" text-anchor="middle" class="body">target velocity: u* = z* − ε</text>
+  <path d="M524 571v45h767v-45" class="flow"/><rect x="666" y="602" width="472" height="27" fill="#fff"/><text x="902" y="622" text-anchor="middle" class="small">Analytic target from sampled ε and cached z*</text>
+
+  <rect x="48" y="672" width="1504" height="252" rx="14" class="panel"/>
+  <text x="74" y="709" class="section">C  Inference</text>
+  <text x="1524" y="708" text-anchor="end" class="small">Fresh noise + current observation</text>
+  <text x="803" y="750" text-anchor="middle" class="math">c = E(o)</text><path d="M738 745H498v48" class="cond"/><path d="M868 745h253v48" class="cond"/>
+  <rect x="88" y="795" width="190" height="84" rx="9" class="data"/><text x="183" y="826" text-anchor="middle" class="label">Gaussian</text><text x="183" y="858" text-anchor="middle" class="math">ε ∼ N(0, I)</text>
+  <path d="M278 837h79" class="flow"/>
+  <rect x="359" y="795" width="278" height="84" rx="9" class="prior"/><text x="498" y="826" text-anchor="middle" class="label">Prior Flow Gφ</text><text x="498" y="858" text-anchor="middle" class="body">integrate vφ · 0 → t*</text>
+  <path d="M637 837h75" class="flow"/>
+  <rect x="714" y="795" width="214" height="84" rx="9" class="data"/><text x="821" y="826" text-anchor="middle" class="label">Adapted source</text><text x="821" y="858" text-anchor="middle" class="math">zₜ*</text>
+  <path d="M928 837h66" class="flow"/>
+  <rect x="996" y="795" width="258" height="84" rx="9" class="frozen"/><text x="1125" y="826" text-anchor="middle" class="label">Action Flow Fθ</text><text x="1125" y="858" text-anchor="middle" class="body">latent → action · 0 → 1</text>
+  <path d="M1254 837h82" class="flow"/>
+  <rect x="1338" y="795" width="146" height="84" rx="9" class="data"/><text x="1411" y="826" text-anchor="middle" class="label">Action</text><text x="1411" y="858" text-anchor="middle" class="math">A</text>
+  <text x="800" y="908" text-anchor="middle" class="small">Depth t* ∈ [0,1] · t* = 0: Gaussian baseline · t* = 1: full learned prior</text>
+  <text x="800" y="958" text-anchor="middle" class="body">Same UNet backbone, independent parameters: learn the source distribution while retaining the action decoder.</text>
+  <text x="800" y="985" text-anchor="middle" class="small">The Action Flow and observation encoder are outside the Prior training graph.</text>
+</svg>
