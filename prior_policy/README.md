@@ -41,7 +41,7 @@ sorted windows: 0, 1, 2, ..., final
 selected:       0, 8, 16, ..., final
 ```
 
-The final window is always retained, which preserves terminal task behavior. [`temporal_thinning/train_stride8_prior.py`](temporal_thinning/train_stride8_prior.py) cycles shuffled passes over the thinned cache to execute the requested optimizer-step budget exactly.
+The final window is always retained, which preserves terminal task behavior. [`temporal_thinning/train_stride8_prior.py`](temporal_thinning/train_stride8_prior.py) cycles shuffled passes over the thinned cache to execute the requested optimizer-step budget exactly. The unified configuration uses `batch_size=32`, 150 epochs, 250 steps per epoch, and `--train-all` for 37,500 optimizer updates.
 
 ## Runtime
 

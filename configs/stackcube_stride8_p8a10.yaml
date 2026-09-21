@@ -1,12 +1,13 @@
-# Matched temporal-thinning experiment for StackCube.
+# Unified temporal-thinning experiment for StackCube.
 method: prior
 seed: 42
 training:
   cache_rule: "per split and episode: windows [::8] plus final window"
-  optimizer_updates: 7500
-  epochs: 30
+  optimizer_updates: 37500
+  epochs: 150
   max_train_steps: 250
   batch_size: 32
+  train_all: true
 inference:
   prior_steps: 8
   action_steps: 10

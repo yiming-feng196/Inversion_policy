@@ -21,7 +21,7 @@ python prior_policy/temporal_thinning/build_stride8_cache.py \
 
 For each episode and split, the script sorts by `sampler_index`, keeps every eighth window, and adds the terminal window. It copies existing cached tensors rather than rerunning Action Flow inversion.
 
-## 3. Train with a matched update budget
+## 3. Train with the unified update budget
 
 The thinned cache has fewer natural minibatches than the full cache. Specify the desired update budget through `epochs` and `max-train-steps`:
 
@@ -36,7 +36,7 @@ python prior_policy/temporal_thinning/train_stride8_prior.py \
   --prior-inference-steps 16 --train-all
 ```
 
-This configuration runs `150 x 250 = 37,500` optimizer updates. The trainer cycles fresh shuffled passes through the thinned cache inside an epoch when needed.
+All reported temporal-thinning runs use `batch_size=32`, `150 x 250 = 37,500` optimizer updates, and `--train-all`. The trainer cycles fresh shuffled passes through the thinned cache inside an epoch when needed. With `--train-all`, the cache validation split is used only as an in-distribution diagnostic; it is not a held-out generalization metric.
 
 ## 4. Evaluate P8+A10
 

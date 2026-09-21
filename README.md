@@ -67,15 +67,15 @@ See [setup](docs/SETUP.md), [reproducibility](docs/REPRODUCIBILITY.md), and the 
 
 ## Reproducibility
 
-The experiment templates in `configs/` document the evaluated settings. They keep the Action Flow frozen, use the same cache split as the original prior, and compare methods under the same optimizer-update budget.
+The experiment templates in `configs/` document the unified temporal-thinning protocol. They keep the Action Flow frozen and use `batch_size=32`, `150 x 250 = 37,500` optimizer updates, and all cached rows for Prior training.
 
-| Task | Training cache | Updates | Inference | Result |
+| Task | Training cache | Updates | Training rows | Inference |
 |---|---:|---:|---|---:|
-| StackCube | stride=8 | 7,500 | P8+A10 | 86/100 across seeds 42, 43 |
-| StackCube | full cache | 7,500 | P8+A10 | 78/100 in matched runs |
-| CloseBox | stride=8 | 37,500 | P8+A10 | 30/50, seed 43 |
+| PickCube | stride=8 | 37,500 | all cached rows | P8+A10 |
+| StackCube | stride=8 | 37,500 | all cached rows | P8+A10 |
+| CloseBox | stride=8 | 37,500 | all cached rows | P8+A10 |
 
-The results are exploratory. Full details, comparison boundaries, and rollout variation are recorded in [`theory/experimental_observations.md`](theory/experimental_observations.md).
+Earlier 7,500-step runs are pilot ablations, not part of this standardized comparison. Full details, comparison boundaries, and rollout variation are recorded in [`theory/experimental_observations.md`](theory/experimental_observations.md).
 
 ## Citation
 

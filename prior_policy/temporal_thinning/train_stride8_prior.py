@@ -54,8 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-groups", type=int, default=8)
     parser.add_argument("--no-cond-predict-scale", action="store_true")
 
-    # Match the frozen Action Flow optimizer/training scale by default.
-    parser.add_argument("--epochs", type=int, default=30)
+    # Unified temporal-thinning protocol: 150 x 250 = 37,500 updates.
+    # Individual ablations can still override this explicitly.
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-train-steps", type=int, default=250)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -70,10 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-inference-steps", type=int, default=16)
     parser.add_argument(
         "--train-all",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Train on every cached sample. The cache validation split is retained "
-            "only as an in-distribution training diagnostic, not as a held-out metric."
+            "Train on every cached sample (the unified default). The cache validation "
+            "split is retained only as an in-distribution training diagnostic, not as "
+            "a held-out metric. Pass --no-train-all for a held-out validation split."
         ),
     )
     parser.add_argument("--resume", action="store_true")

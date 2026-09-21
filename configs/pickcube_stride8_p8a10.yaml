@@ -1,4 +1,4 @@
-# Unified temporal-thinning experiment for CloseBox.
+# Unified temporal-thinning experiment for PickCube.
 method: prior
 seed: 42
 training:
@@ -12,10 +12,10 @@ inference:
   prior_steps: 8
   action_steps: 10
 evaluation:
-  task: close_box
+  task: pick_cube
   robot: franka
   simulator: isaacsim
   environment_seed: 43
   noise_seed: 0
   max_demos: 50
-  max_steps: 300
+  max_steps: 200
