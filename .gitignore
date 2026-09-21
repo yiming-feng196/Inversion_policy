@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.ckpt
+*.zarr/
+il_outputs/
+data_policy/
+roboverse_data/
+*.log
+.env
