@@ -8,7 +8,7 @@
 
 ![Expert-Inversion Prior Flow: offline inversion, conditional flow-matching training, and inference through a frozen Action Flow.](../assets/prior_flow_architecture.svg)
 
-[核心代码与使用说明](../prior_policy/full_data_prior/) · [架构图 SVG](../assets/prior_flow_architecture.svg)
+[核心代码与使用说明](../prior_policy/full_data/) · [架构图 SVG](../assets/prior_flow_architecture.svg)
 
 ## 代码文件
 

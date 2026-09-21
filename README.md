@@ -1,16 +1,86 @@
 # Inversion Policy
 
-Research code for a learned Prior Flow that maps Gaussian source noise to expert-inversion action latents before a frozen Action Flow produces executable actions.
+<p align="center">
+  <img src="assets/prior_flow_architecture.svg" width="780" alt="Prior Flow architecture" />
+</p>
 
-## Layout
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#repository-layout">Repository Layout</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#reproducibility">Reproducibility</a> ·
+  <a href="prior_policy/README.md">Method</a>
+</p>
 
-- `prior_policy/full_data_prior/`: the original, full-cache Prior Flow trainer.
-- `prior_policy/temporal_thinning/`: the current stride=8 implementation and cache tools.
-- `prior_policy/runtime/`: frozen Action Flow interface, prior inference, and closed-loop rollout entry point.
-- `theory/`: method rationale and experimental analysis.
+## Overview
 
-## Dependency
+**Inversion Policy** learns a conditional Prior Flow over expert-inversion latents for a frozen Flow Matching policy. The Prior maps Gaussian source noise into a behavior-compatible latent; the frozen Action Flow then decodes that latent into an action chunk.
 
-These modules run inside the MomentVLA / Roboverse codebase. They intentionally retain imports such as `roboverse_learn.*`; place this repository alongside that codebase or add it to `PYTHONPATH`.
+```text
+observation -> frozen encoder -> condition c
+Gaussian noise -> Prior Flow -> latent z -> frozen Action Flow -> action chunk
+```
 
-Model weights, datasets, cached inversions, videos, and rollout outputs are intentionally excluded.
+The current method uses **temporal thinning**: it removes redundant overlapping action windows from an expert-inversion cache while preserving temporal coverage in each demonstration. The validated deployment setting is **P8+A10**: eight Euler steps for the Prior Flow followed by ten Action Flow steps.
+
+## Repository Layout
+
+```text
+Inversion_policy/
+├── assets/                         # figures used in documentation
+├── configs/                        # reproducible experiment templates
+├── docs/                           # setup and reproduction instructions
+├── prior_policy/
+│   ├── full_data/                  # original Prior Flow over every cached window
+│   ├── temporal_thinning/          # stride=8 cache derivation and training
+│   └── runtime/                    # Prior sampling and closed-loop rollout
+├── theory/                         # method rationale and experiment analysis
+└── legacy/                         # earlier latent-geometry and region-tracking studies
+```
+
+The active implementation is under [`prior_policy/`](prior_policy/README.md). The original full-data method is retained separately under [`prior_policy/full_data/`](prior_policy/full_data/). Earlier exploratory work is isolated in `legacy/` and is not part of the current training or rollout path.
+
+## Quick Start
+
+This project runs inside a compatible MomentVLA / RoboVerse checkout. It expects a frozen Action Flow checkpoint and an offline expert-inversion cache; neither is distributed in this repository.
+
+```bash
+# 1. Install the Python dependencies in the MomentVLA environment.
+pip install -r requirements.txt
+
+# 2. Build a stride=8 subset from an existing full inversion cache.
+python prior_policy/temporal_thinning/build_stride8_cache.py \
+  --source-cache /path/to/full_inversion_cache \
+  --output-cache /path/to/stride8_inversion_cache \
+  --stride 8
+
+# 3. Train a Prior with a fixed update budget.
+python prior_policy/temporal_thinning/train_stride8_prior.py \
+  --repo /path/to/MomentVLA-main \
+  --cache /path/to/stride8_inversion_cache \
+  --output-dir /path/to/output/prior_stride8 \
+  --action-flow-checkpoint /path/to/action_flow.ckpt \
+  --epochs 150 --max-train-steps 250 --train-all
+```
+
+See [setup](docs/SETUP.md), [reproducibility](docs/REPRODUCIBILITY.md), and the [method guide](prior_policy/README.md) for full commands and evaluation settings.
+
+## Reproducibility
+
+The experiment templates in `configs/` document the evaluated settings. They keep the Action Flow frozen, use the same cache split as the original prior, and compare methods under the same optimizer-update budget.
+
+| Task | Training cache | Updates | Inference | Result |
+|---|---:|---:|---|---:|
+| StackCube | stride=8 | 7,500 | P8+A10 | 86/100 across seeds 42, 43 |
+| StackCube | full cache | 7,500 | P8+A10 | 78/100 in matched runs |
+| CloseBox | stride=8 | 37,500 | P8+A10 | 30/50, seed 43 |
+
+The results are exploratory. Full details, comparison boundaries, and rollout variation are recorded in [`theory/experimental_observations.md`](theory/experimental_observations.md).
+
+## Citation
+
+If you use this repository, please cite the associated work once available. Until then, link directly to this repository and identify the commit hash used for the experiment.
+
+## License and Data
+
+This repository contains source code and documentation only. Checkpoints, demonstrations, cached inversion latents, videos, and rollout outputs are intentionally excluded. Use the licensing terms of the underlying MomentVLA / RoboVerse project and task assets.

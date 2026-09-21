@@ -1,0 +1,20 @@
+# Matched temporal-thinning experiment for CloseBox.
+method: prior
+seed: 42
+training:
+  cache_rule: "per split and episode: windows [::8] plus final window"
+  optimizer_updates: 37500
+  epochs: 150
+  max_train_steps: 250
+  batch_size: 32
+inference:
+  prior_steps: 8
+  action_steps: 10
+evaluation:
+  task: close_box
+  robot: franka
+  simulator: isaacsim
+  environment_seed: 43
+  noise_seed: 0
+  max_demos: 50
+  max_steps: 300
