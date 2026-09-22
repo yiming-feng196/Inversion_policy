@@ -18,6 +18,11 @@ inference implementation. SHA256 provenance is in
   resume its queue without authorization. Pi0 remains deferred.
 - Active denominator: 30 task/base combinations and 10,500 rollouts.
 
+The separate [π₀ two-task LIBERO-90 requirements](pi0/TWO_TASK_REQUIREMENTS.md)
+specify stride-8 experiments on task 35 and candidate task 8, including baseline
+confirmation before expensive inversion. This is a requirements-only plan, not
+an activation of the π₀ queue; task 8's π₀ baseline is not yet established.
+
 Task order is fixed in [`active_scope.json`](active_scope.json): original five
 IDs **35, 13, 8, 44, 73**, followed by **0, 16, 19, 21, 27, 33, 46, 62, 65, 86**.
 [`tasks.json`](tasks.json) maps the official LIBERO-90 IDs to full task names.
