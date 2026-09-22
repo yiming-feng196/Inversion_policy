@@ -9,7 +9,8 @@
   <a href="#repository-layout">Repository Layout</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#reproducibility">Reproducibility</a> ·
-  <a href="prior_policy/README.md">Method</a>
+  <a href="prior_policy/README.md">Method</a> ·
+  <a href="real_robot/README.md">Real Robot</a>
 </p>
 
 ## Overview
@@ -34,11 +35,12 @@ Inversion_policy/
 │   ├── full_data/                  # original Prior Flow over every cached window
 │   ├── temporal_thinning/          # stride=8 cache derivation and training
 │   └── runtime/                    # Prior sampling and closed-loop rollout
+├── real_robot/                     # LeRobot v3 conversion, training, and deployment
 ├── theory/                         # method rationale and experiment analysis
 └── legacy/                         # earlier latent-geometry and region-tracking studies
 ```
 
-The active implementation is under [`prior_policy/`](prior_policy/README.md). The original full-data method is retained separately under [`prior_policy/full_data/`](prior_policy/full_data/). Earlier exploratory work is isolated in `legacy/` and is not part of the current training or rollout path.
+The active implementation is under [`prior_policy/`](prior_policy/README.md). The original full-data method is retained separately under [`prior_policy/full_data/`](prior_policy/full_data/). LeRobot v3 datasets and hardware-facing inference are documented under [`real_robot/`](real_robot/README.md). Earlier exploratory work is isolated in `legacy/` and is not part of the current training or rollout path.
 
 ## Quick Start
 

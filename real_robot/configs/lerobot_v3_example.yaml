@@ -1,0 +1,48 @@
+# Copy this file into the experiment output directory and record all resolved values.
+dataset:
+  format: lerobot_v3
+  root: /path/to/lerobot_dataset
+  repo_id: local/my_real_task
+  camera_key: observation.images.front
+  state_key: observation.state
+  action_key: action
+  image_size: 256
+  frame_stride: 1
+  source_fps: null
+  effective_fps: null
+
+action_contract:
+  representation: absolute_joint_position
+  arm_unit: rad
+  gripper_unit: normalized_position
+  state_dim: 8
+  action_dim: 8
+  gripper_action_index: 7
+
+fm_unet:
+  horizon: 16
+  observation_steps: 8
+  action_steps: 8
+  batch_size: 32
+  max_total_steps: 50000
+  validation_ratio: 0.1
+
+prior:
+  history: 12
+  cache_stride: 8
+  retain_final_window: true
+  retain_gripper_events: true
+  retain_velocity_events: true
+  batch_size: 32
+  epochs: 150
+  max_steps_per_epoch: 250
+  train_all: true
+  inference_steps: 8
+  action_flow_steps: 10
+
+deployment:
+  execute_steps: 1
+  control_hz: 10
+  position_lower: null
+  position_upper: null
+  max_delta_per_command: null

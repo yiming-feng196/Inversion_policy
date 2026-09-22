@@ -1,0 +1,6 @@
+# Install together with the MomentVLA and LeRobot environments.
+lerobot>=0.6.0
+numpy
+torch
+zarr<3
+numcodecs
