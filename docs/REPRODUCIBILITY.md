@@ -1,5 +1,17 @@
 # Reproducibility Guide
 
+## LIBERO snapshot (2026-09-22)
+
+The running 15-task LIBERO-90 protocol is documented separately in
+[`prior_policy/libero90/README.md`](../prior_policy/libero90/README.md), with
+server source hashes and observed environments in its
+[`SNAPSHOT_PROVENANCE.json`](../prior_policy/libero90/SNAPSHOT_PROVENANCE.json).
+It uses train-only normalization, disjoint episode splits, 10,000 base updates,
+5,000 prior updates, RK4-256 inversion, Euler-16 source sampling and Midpoint-10
+action decoding. Active bases are FM-UNet and FM-DiT; DP is paused and pi0 deferred.
+Do not apply the older `--train-all`, 37,500-update or P8 settings below to the
+LIBERO results. The following sections describe the separate original protocol.
+
 ## 1. Produce or obtain a full expert-inversion cache
 
 The current release supports direct temporal thinning from a full cache whose shards contain at least:

@@ -14,6 +14,12 @@
 
 ## Overview
 
+**September 22 lab snapshot:** the current LIBERO-90 FM-UNet/DiT experiments,
+conditional Gaussian/Flow priors, and evaluation code are available under
+[`prior_policy/libero90/`](prior_policy/libero90/README.md). This is a separate
+15-task protocol (5,000 prior updates, P16 + Midpoint-10), not the IsaacSim
+P8+A10 configuration described below. DP is paused; pi0 is deferred.
+
 **Inversion Policy** learns a conditional Prior Flow over expert-inversion latents for a frozen Flow Matching policy. The Prior maps Gaussian source noise into a behavior-compatible latent; the frozen Action Flow then decodes that latent into an action chunk.
 
 ```text

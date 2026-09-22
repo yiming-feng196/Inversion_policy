@@ -1,0 +1,80 @@
+{
+  "snapshot_date": "2026-09-22",
+  "scope": "LIBERO-90 selected 15 tasks; active FM-UNet and FM-DiT; DP paused, pi0 deferred",
+  "server_source_root": "/data/jhr/libero90_thinning_20260921",
+  "fm_adapter_source_root": "/data/jhr/q1_libero_crossarch_20260915/code_v2_20260916",
+  "base_repository_commit": "bd132c37d32c868d1df531bd6b3fbea01a45a65d",
+  "notes": [
+    "Runtime files copied byte-for-byte from the lab server; no training or inference implementation changes.",
+    "Server README and STATUS are retained under explicitly historical names; new README describes the active scope.",
+    "External MomentVLA checkout is not a Git working tree; use the recorded backbone file hashes, not an inferred upstream commit.",
+    "No data, model weights, latent caches or rollout records are included."
+  ],
+  "source_sha256": {
+    "EXTENSION_RUNBOOK.md": "9c9f12dcdb236817277515b27c315872408dbe9ec96243e1fa7b6ec76a6aa52e",
+    "active_scope.json": "48c39eba9c183115cd88fe110dedeb212b072cf951ecfe54350561f5c86e7b4a",
+    "audit_frs_tasks.py": "678804afdd4635d45141fb92bcbb7c8d410031efd8f9969246bf3e4dccb689b3",
+    "collect_status.py": "c428959d43608a4475b2a5ac90f6656d4fe8890a7a3897670e456547bdefdf9a",
+    "continue_extension.py": "ebedaf47ef63ac9b32cc605cc268908f5e5c8a5740a48e95c8be3ac60236accf",
+    "derive_cache.py": "c8a01db51864645a1830adfab013ea5090db4ffdf15c84289399ac61c35dfa12",
+    "dp_adapter/libero_fm.py": "23e891634e457edc07cee89c870933fbae1ead960050d66faac5837e5b53ce39",
+    "evaluation/eval_closed_loop.py": "8db3418f38abf9642afb68d4c7a60545b0a5d87bff57b135367a863388cc0993",
+    "evaluation/libero_eval_utils.py": "79dc32be9e689c2d2e4b34b8c1b2a5f70e1ed65840829c6099fb806d2213529c",
+    "evaluation/preflight_libero.py": "89199d023a6d43e17a50632b7efada5e2f10310f367b46281083ecebf827bd55",
+    "extract_cache.py": "3f6a4ffd4bde0177e10cb784dd8f5c2411685b943cb0becab169e49f42d57d1d",
+    "pause_robocasa.py": "f43ed39d53e38515e8534f22554571f4a1d47e5fee049c0d0bdac8f71bc19720",
+    "pi0/evaluate.py": "6b5b4bab8e2d466f1e9c8d255ad175c2f29802e88ebb1a6a29ad8bad8dfe32ce",
+    "pi0/extract.py": "fb98c08ac643b200f5b4cfbbd0dda8f26dd4349f1bf649ceb1fe2e0258f77db8",
+    "pi0/prior_models.py": "cb55fda49b533b85569e47d4640befed3f0a0368794b9bf1ecfd5e59ced69027",
+    "pi0/protocol.py": "c651e093ff7ed8fde402534e7353f2d2b5be158aa0fb4bbbfbb3c72e03b59d8e",
+    "pi0/runtime.py": "0fc0971a4123f18231a04c33280831e5aff53db6423c502d6f0c1b85a44d0f9e",
+    "pi0/serve.py": "5745bf383ae6e7676d66dde498287a61a5161b9ca963930b0d201123f0185faf",
+    "pi0/train.py": "091983305cc53d8d6bc6f4b9c7b0c2119583c615861c781d016e1ed546133d76",
+    "prepare_data.py": "8630e6159c565f214f669d2f7a151a3516a6d4d92c877882952b824972379eef",
+    "refresh_control_diagnostics.py": "97eeb568c79d84596cc732eee1826ea2f35f12ef0529108dce889ef1e1a3f4d8",
+    "run_queue.py": "9594232309240dfe89fbbf0106be64e0ca8922e1f74a45671dabbc2e68e9640b",
+    "switch_to_five.py": "12b04fb06682b108976d3a25734b98d7aae1ff242ba1cb960a11585a5b85feaf",
+    "tasks.json": "dd9089a336c394203e9483682d59cd80bf8ad784f32b9f77f3baa837cb97c8d2",
+    "test_dp_scheduler.py": "6a31bc3d71ca93c9659a5395ca46965dd782485fafe7a75ed70aa3a335eac1e3",
+    "test_extension.py": "76c0222670431d04af002d08521356d3a68d8ff69cf996dbc60c26901283ce85",
+    "test_thinning.py": "e62ae2fa9ff7d7d12ae89cf0f189d423167ed4213753e6fc481968b1f17585b0",
+    "thinning.py": "f22f63d28835de282091484af752d3dde37fd133a098ff210255448ee844897b",
+    "training/protocol.py": "8637392e8ab3ff55b556538be315626c3c1ffa67bb7dc043648a3e80644ed490",
+    "training/source_models.py": "612ee9ee135b45f8ccdff93ccda1cc642d4f2fd698bfef5a2b449f5d1336ae0b",
+    "training/train_samplers.py": "99aaf8e426ce7937b224bb530bc50aad0806442216f22feda9a1c53fe175041f",
+    "fm_adapter/libero_fm.py": "69ab42aeea3e276b5a6b14fdbcd95cadc5c2a4a76733346da1dc9068bbd2aaca",
+    "fm_adapter/q1_statistics.py": "c5774139341caac56e4c79a146229bd36da84530e32ccc37d178ed0d7fa5b363",
+    "fm_adapter/run_queue.py": "5474e3acea0b45268887adb12910af4be8c778ae7ac3d233d127c4704eb0d0b1",
+    "fm_adapter/test_libero_fm.py": "65714cbd026e932edd0deb503f0a10aea0b446f02941b09e75c520729c28ae00"
+  },
+  "external_backbone_sha256": {
+    "roboverse_learn/il/utils/models/flow_net.py": "5051217037c46d512a9c6552b0a36fd1b57d53857b35289c98f14293eb270d5d",
+    "roboverse_learn/il/utils/models/layers.py": "829cbd49940bdbe4c5c44c47c2db720141db5aa92c95dd340399bf7b82e4435a",
+    "roboverse_learn/il/policies/dp/models/diffusion/conditional_unet1d.py": "4451b528cddc294936426ff1ed5b4a06be9349f653328d11ce6c4f80047f5269",
+    "roboverse_learn/il/policies/dp/models/diffusion/conv1d_components.py": "e7d70330cfbbac05fc5106713945e9fcb5c3b741b764375b3e0beacbbc79b6d5",
+    "roboverse_learn/il/policies/dp/models/diffusion/positional_embedding.py": "8952cab68f00e8f46c750ca0bd3a799615c296477175b1aa407e13811e0bf0d1"
+  },
+  "observed_environments": {
+    "training": {
+      "python": "3.12.13",
+      "torch": "2.11.0",
+      "torchvision": "0.26.0",
+      "numpy": "2.2.6",
+      "h5py": "3.16.0",
+      "einops": "0.8.2",
+      "huggingface-hub": "1.24.0"
+    },
+    "simulation": {
+      "python": "3.12.13",
+      "torch": "2.11.0",
+      "torchvision": "0.26.0",
+      "numpy": "1.26.4",
+      "scipy": "1.17.1",
+      "h5py": "3.16.0",
+      "einops": "0.8.2",
+      "robosuite": "1.4.1",
+      "mujoco": "3.3.2",
+      "libero": "0.1.0"
+    }
+  }
+}
