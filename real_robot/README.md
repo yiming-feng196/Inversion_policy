@@ -151,3 +151,24 @@ Before enabling actuation, verify all of the following on recorded observations:
 The repository does not call a hardware SDK directly. Add the robot-specific
 `read_observation()` and `send_joint_target()` calls in the deployment process,
 outside the model adapter.
+
+## Validated two-view FM-UNet runtime
+
+The current real-robot FM-UNet path uses 128x128 synchronized RGB histories
+from agentview_camera and eye_in_hand_camera, together with 8D joint/gripper
+state and 8D joint/gripper action. It follows the LeRobot-DP visual setup:
+ImageNet initialized ResNet-18, BatchNorm, independent encoders per camera,
+and dataset mean/std image normalization.
+
+Apply the patches before training. Copy the files under
+real_robot/patches/roboverse_learn into the matching MomentVLA source paths.
+They make validation select the deployed EMA model and synchronize BatchNorm
+running buffers into that EMA after every optimizer update.
+
+Copy real_robot/deployment/fm_unet_runtime.py and
+real_robot/deployment/verify_fm_unet_checkpoint.py into
+MomentVLA-main/deployment/real_robot. Use
+real_robot/scripts/train_fm_unet_lerobot_dp.sh to train. Before live hardware,
+run verify_fm_unet_checkpoint.py against the training Zarr. The verification
+asserts that deployment preprocessing and action inference reproduce the
+training path exactly.

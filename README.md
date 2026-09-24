@@ -86,3 +86,11 @@ If you use this repository, please cite the associated work once available. Unti
 ## License and Data
 
 This repository contains source code and documentation only. Checkpoints, demonstrations, cached inversion latents, videos, and rollout outputs are intentionally excluded. Use the licensing terms of the underlying MomentVLA / RoboVerse project and task assets.
+
+## Latest real-robot FM-UNet
+
+The validated two-view FM-UNet runtime is under
+[real_robot/deployment](real_robot/deployment). It loads the checkpoint
+configuration, EMA state, LeRobot-DP ResNet, and saved normalizer as one unit.
+The accompanying verification program checks exact equivalence between Zarr
+training inputs and deployment inputs before hardware is attached.
